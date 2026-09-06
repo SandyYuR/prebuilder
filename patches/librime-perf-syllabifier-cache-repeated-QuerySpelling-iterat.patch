@@ -1,28 +1,5 @@
-From a9eb3d52d83007718fb2f0055c5efbde586281bd Mon Sep 17 00:00:00 2001
-From: fxliang <fx.liang@outlook.com>
-Date: Wed, 29 Jul 2026 12:07:00 +0800
-Subject: [PATCH] perf(syllabifier): cache repeated QuerySpelling iterations in
- syllable graph building
-
-Introduce a per-call spelling cache in BuildSyllableGraph to avoid
-re-iterating the same SpellingDescriptor list when the same spelling_id
-is queried from multiple BFS vertices (e.g., ambiguous parsing paths).
-
-Also hoist the Prism::Match vector outside the BFS loop to preserve
-capacity across iterations, reducing per-vertex reallocation.
-
-As a supporting change, Prism::CommonPrefixSearch now reserves
-capacity on reused result vectors and explicitly clears on empty
-key for consistent behavior.
----
- src/rime/algo/syllabifier.cc |  40 ++++++++----
- src/rime/dict/prism.cc       |  19 ++++--
- test/prism_test.cc           |  28 +++++++++
- test/syllabifier_test.cc     | 119 ++++++++++++++++++++++++++++++++++-
- 4 files changed, 190 insertions(+), 16 deletions(-)
-
 diff --git a/src/rime/algo/syllabifier.cc b/src/rime/algo/syllabifier.cc
-index 11d0efc5..22577106 100644
+index a133f7c..dc18314 100644
 --- a/src/rime/algo/syllabifier.cc
 +++ b/src/rime/algo/syllabifier.cc
 @@ -34,10 +34,30 @@ int Syllabifier::BuildSyllableGraph(const string& input,
@@ -65,7 +42,7 @@ index 11d0efc5..22577106 100644
      set<SyllableId> exact_match_syllables;
      std::string_view current_input(input.data() + begin_pos,
                                     input.length() - begin_pos);
-@@ -106,10 +126,11 @@ int Syllabifier::BuildSyllableGraph(const string& input,
+@@ -123,10 +143,11 @@ int Syllabifier::BuildSyllableGraph(const string& input,
          // when spelling algebra is enabled,
          // a spelling evaluates to a set of syllables;
          // otherwise, it resembles exactly the syllable itself.
@@ -81,7 +58,7 @@ index 11d0efc5..22577106 100644
            if (strict_spelling_ && matches_input &&
                props.type != kNormalSpelling) {
              // disqualify fuzzy spelling or abbreviation as single word
-@@ -134,7 +155,6 @@ int Syllabifier::BuildSyllableGraph(const string& input,
+@@ -151,7 +172,6 @@ int Syllabifier::BuildSyllableGraph(const string& input,
                end_vertex_type = props.type;
              }
            }
@@ -89,7 +66,7 @@ index 11d0efc5..22577106 100644
          }
          if (spellings.empty()) {
            DLOG(INFO) << "not spelled.";
-@@ -221,10 +241,9 @@ int Syllabifier::BuildSyllableGraph(const string& input,
+@@ -238,10 +258,9 @@ int Syllabifier::BuildSyllableGraph(const string& input,
          // when spelling algebra is enabled,
          // a spelling evaluates to a set of syllables;
          // otherwise, it resembles exactly the syllable itself.
@@ -103,7 +80,7 @@ index 11d0efc5..22577106 100644
            if (props.type < kAbbreviation) {
              props.type = kCompletion;
              props.credibility += kCompletionPenalty;
-@@ -233,7 +252,6 @@ int Syllabifier::BuildSyllableGraph(const string& input,
+@@ -250,7 +269,6 @@ int Syllabifier::BuildSyllableGraph(const string& input,
              // spelling-to-syllable map
              spellings.insert({syllable_id, props});
            }
@@ -112,10 +89,10 @@ index 11d0efc5..22577106 100644
        }
        if (spellings.empty()) {
 diff --git a/src/rime/dict/prism.cc b/src/rime/dict/prism.cc
-index 17d2e588..537ab260 100644
+index 146c23b..7175fa7 100644
 --- a/src/rime/dict/prism.cc
 +++ b/src/rime/dict/prism.cc
-@@ -273,11 +273,22 @@ bool Prism::GetValue(const string& key, int* value) const {
+@@ -277,11 +277,22 @@ bool Prism::GetValue(std::string_view key, int* value) const {
  // Given a key, search all the keys in the tree that share
  // a common prefix with that key.
  void Prism::CommonPrefixSearch(std::string_view key, vector<Match>* result) {
@@ -143,10 +120,10 @@ index 17d2e588..537ab260 100644
  }
  
 diff --git a/test/prism_test.cc b/test/prism_test.cc
-index 04bccd39..60be5076 100644
+index b21db44..7b8fea1 100644
 --- a/test/prism_test.cc
 +++ b/test/prism_test.cc
-@@ -121,3 +121,31 @@ TEST_F(RimePrismTest, ExpandSearchWithLength) {
+@@ -125,3 +125,31 @@ TEST_F(RimePrismTest, ExpandSearchWithLength) {
    EXPECT_EQ(result[2].value, 3);
    EXPECT_EQ(result[2].length, 7);
  }
@@ -179,18 +156,10 @@ index 04bccd39..60be5076 100644
 +  EXPECT_TRUE(result.empty());
 +}
 diff --git a/test/syllabifier_test.cc b/test/syllabifier_test.cc
-index fa748ff3..dca26a85 100644
+index b4740d4..cd0f71f 100644
 --- a/test/syllabifier_test.cc
 +++ b/test/syllabifier_test.cc
-@@ -7,6 +7,7 @@
- #include <algorithm>
- #include <utility>
- #include <gtest/gtest.h>
-+#include <rime/algo/algebra.h>
- #include <rime/dict/prism.h>
- #include <rime/algo/syllabifier.h>
- 
-@@ -38,7 +39,10 @@ class RimeSyllabifierTest : public ::testing::Test {
+@@ -41,7 +41,10 @@ class RimeSyllabifierTest : public ::testing::Test {
      prism_->Build(keyset);
    }
  
@@ -201,10 +170,10 @@ index fa748ff3..dca26a85 100644
 +  }
  
   protected:
-   rime::map<rime::string, rime::SyllableId> syllable_id_;
-@@ -211,3 +215,116 @@ TEST_F(RimeSyllabifierTest, TrimBothLeadingAndTrailingDelimiters) {
-   EXPECT_EQ(rime::kNormalSpelling, sp[0].type);
-   EXPECT_EQ(0.0, sp[0].credibility);
+   map<string, SyllableId> syllable_id_;
+@@ -358,3 +361,116 @@ TEST_F(CanonicalizeSyllabifierTest, NullCanonicalizerFallback) {
+       "FZURO", *loaded_prism_, &graph_disordered);
+   EXPECT_NE(5, farthest_disordered);
  }
 +
 +// Tests that the spelling cache is used correctly when the same spelling_id
@@ -319,6 +288,3 @@ index fa748ff3..dca26a85 100644
 +
 +  test_prism->Remove();
 +}
--- 
-2.43.0
-

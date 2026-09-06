@@ -1,5 +1,5 @@
 diff --git a/src/rime/context.cc b/src/rime/context.cc
-index ec840a3e..39d5e5c5 100644
+index cab1371..07171f3 100644
 --- a/src/rime/context.cc
 +++ b/src/rime/context.cc
 @@ -70,6 +70,8 @@ bool Context::PushInput(char ch) {
@@ -138,8 +138,8 @@ index ec840a3e..39d5e5c5 100644
  void Context::set_option(const string& name, bool value) {
    options_[name] = value;
    DLOG(INFO) << "Context::set_option " << name << " = " << value;
-@@ -324,4 +417,57 @@ void Context::ClearTransientOptions() {
-   }
+@@ -330,4 +423,57 @@ Composition::CandidatePreview Context::GetCandidatePreview() const {
+   return composition_.GetCandidatePreview(input_);
  }
  
 +void Context::AddTabConstraint(size_t position,
@@ -197,10 +197,10 @@ index ec840a3e..39d5e5c5 100644
 +
  }  // namespace rime
 diff --git a/src/rime/context.h b/src/rime/context.h
-index d5261300..745ddeb4 100644
+index f12bcc8..79588d5 100644
 --- a/src/rime/context.h
 +++ b/src/rime/context.h
-@@ -62,6 +62,8 @@ class RIME_DLL Context {
+@@ -64,6 +64,8 @@ class RIME_DLL Context {
  
    void set_input(const string& value);
    const string& input() const { return input_; }
@@ -209,7 +209,7 @@ index d5261300..745ddeb4 100644
  
    void set_caret_pos(size_t caret_pos);
    size_t caret_pos() const { return caret_pos_; }
-@@ -95,6 +97,24 @@ class RIME_DLL Context {
+@@ -97,6 +99,24 @@ class RIME_DLL Context {
    }
    KeyEventNotifier& unhandled_key_notifier() { return unhandled_key_notifier_; }
  
@@ -234,7 +234,7 @@ index d5261300..745ddeb4 100644
   private:
    string GetSoftCursor() const;
  
-@@ -104,6 +124,8 @@ class RIME_DLL Context {
+@@ -106,6 +126,8 @@ class RIME_DLL Context {
    CommitHistory commit_history_;
    map<string, bool> options_;
    map<string, string> properties_;
@@ -244,7 +244,7 @@ index d5261300..745ddeb4 100644
    Notifier commit_notifier_;
    Notifier select_notifier_;
 diff --git a/src/rime/engine.cc b/src/rime/engine.cc
-index 4a54f64c..4bff6666 100644
+index 4a54f64..4bff666 100644
 --- a/src/rime/engine.cc
 +++ b/src/rime/engine.cc
 @@ -8,6 +8,7 @@
@@ -284,7 +284,7 @@ index 4a54f64c..4bff6666 100644
      for (auto& translator : translators_) {
        auto translation = translator->Query(input, segment);
 diff --git a/src/rime/engine.h b/src/rime/engine.h
-index 6b51a68e..7d2b27c2 100644
+index 6b51a68..7d2b27c 100644
 --- a/src/rime/engine.h
 +++ b/src/rime/engine.h
 @@ -10,12 +10,14 @@
@@ -316,7 +316,7 @@ index 6b51a68e..7d2b27c2 100644
    Context* context() const { return context_.get(); }
    CommitSink& sink() { return sink_; }
 diff --git a/src/rime/gear/editor.cc b/src/rime/gear/editor.cc
-index 37b3dda6..f512da82 100644
+index 37b3dda..f512da8 100644
 --- a/src/rime/gear/editor.cc
 +++ b/src/rime/gear/editor.cc
 @@ -125,8 +125,13 @@ bool Editor::CommitComposition(Context* ctx) {
@@ -336,7 +336,7 @@ index 37b3dda6..f512da82 100644
  }
  
 diff --git a/src/rime/gear/reverse_lookup_translator.cc b/src/rime/gear/reverse_lookup_translator.cc
-index c8c9e973..8ac5312f 100644
+index c8c9e97..8ac5312 100644
 --- a/src/rime/gear/reverse_lookup_translator.cc
 +++ b/src/rime/gear/reverse_lookup_translator.cc
 @@ -6,6 +6,7 @@
@@ -580,7 +580,7 @@ index c8c9e973..8ac5312f 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/reverse_lookup_translator.h b/src/rime/gear/reverse_lookup_translator.h
-index 7ca038f6..a29dba28 100644
+index 7ca038f..a29dba2 100644
 --- a/src/rime/gear/reverse_lookup_translator.h
 +++ b/src/rime/gear/reverse_lookup_translator.h
 @@ -10,6 +10,7 @@
@@ -625,10 +625,10 @@ index 7ca038f6..a29dba28 100644
  
  }  // namespace rime
 diff --git a/src/rime/gear/script_translator.cc b/src/rime/gear/script_translator.cc
-index aef62178..3b3483e6 100644
+index eae1293..c786bef 100644
 --- a/src/rime/gear/script_translator.cc
 +++ b/src/rime/gear/script_translator.cc
-@@ -94,6 +94,8 @@ class ScriptSyllabifier : public PhraseSyllabifier {
+@@ -95,6 +95,8 @@ class ScriptSyllabifier : public PhraseSyllabifier {
  
    virtual Spans Syllabify(const Phrase* phrase);
    size_t BuildSyllableGraph(Prism& prism);
@@ -637,7 +637,7 @@ index aef62178..3b3483e6 100644
    string GetPreeditString(const Phrase& cand) const;
    string GetOriginalSpelling(const Phrase& cand) const;
    bool IsCorrection(const Code& code, size_t code_length) const;
-@@ -116,6 +118,7 @@ class ScriptTranslation : public Translation {
+@@ -117,6 +119,7 @@ class ScriptTranslation : public Translation {
                      const string& input,
                      size_t start,
                      size_t end_of_input,
@@ -645,7 +645,7 @@ index aef62178..3b3483e6 100644
                      int max_sentences,
                      double sentence_cutoff_threshold)
        : translator_(translator),
-@@ -124,6 +127,7 @@ class ScriptTranslation : public Translation {
+@@ -125,6 +128,7 @@ class ScriptTranslation : public Translation {
          end_of_input_(end_of_input),
          syllabifier_(
              New<ScriptSyllabifier>(translator, corrector, input, start)),
@@ -653,7 +653,7 @@ index aef62178..3b3483e6 100644
          enable_correction_(corrector),
          max_sentences_(max_sentences),
          sentence_cutoff_threshold_(sentence_cutoff_threshold) {
-@@ -151,6 +155,7 @@ class ScriptTranslation : public Translation {
+@@ -152,6 +156,7 @@ class ScriptTranslation : public Translation {
    size_t start_;
    size_t end_of_input_;
    an<ScriptSyllabifier> syllabifier_;
@@ -661,7 +661,7 @@ index aef62178..3b3483e6 100644
  
    an<DictEntryCollector> phrase_;
    an<UserDictEntryCollector> user_phrase_;
-@@ -204,14 +209,68 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
+@@ -211,14 +216,68 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
    }
  }
  
@@ -732,7 +732,7 @@ index aef62178..3b3483e6 100644
  
    FinishSession();
  
-@@ -221,13 +280,14 @@ an<Translation> ScriptTranslator::Query(const string& input,
+@@ -228,13 +287,14 @@ an<Translation> ScriptTranslator::Query(const string& input,
    size_t end_of_input = engine_->context()->input().length();
    // the translator should survive translations it creates
    auto result = New<ScriptTranslation>(
@@ -750,7 +750,7 @@ index aef62178..3b3483e6 100644
    if (contextual_suggestions_) {
      return poet_->ContextualWeighted(deduped, input, segment.start, this);
    }
-@@ -347,6 +407,97 @@ bool ScriptTranslator::Memorize(const CommitEntry& commit_entry) {
+@@ -354,6 +414,97 @@ bool ScriptTranslator::Memorize(const CommitEntry& commit_entry) {
    return true;
  }
  
@@ -848,7 +848,7 @@ index aef62178..3b3483e6 100644
  // ScriptSyllabifier implementation
  
  Spans ScriptSyllabifier::Syllabify(const Phrase* phrase) {
-@@ -369,6 +520,128 @@ size_t ScriptSyllabifier::BuildSyllableGraph(Prism& prism) {
+@@ -376,6 +527,128 @@ size_t ScriptSyllabifier::BuildSyllableGraph(Prism& prism) {
                                                   &syllable_graph_);
  }
  
@@ -977,7 +977,7 @@ index aef62178..3b3483e6 100644
  bool ScriptSyllabifier::IsCorrection(const Code& code,
                                       size_t code_length) const {
    vector<bool> path_attributes;
-@@ -452,6 +725,10 @@ static bool has_exact_match_phrase(Ptr ptr, Iter iter, size_t consumed) {
+@@ -459,6 +732,10 @@ static bool has_exact_match_phrase(Ptr ptr, Iter iter, size_t consumed) {
  
  bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
    size_t consumed = syllabifier_->BuildSyllableGraph(*dict->prism());
@@ -988,7 +988,7 @@ index aef62178..3b3483e6 100644
    const auto& syllable_graph = syllabifier_->syllable_graph();
    bool predict_word = translator_->enable_word_completion() &&
                        start_ + consumed == end_of_input_;
-@@ -643,6 +920,7 @@ iter_incremented:
+@@ -650,6 +927,7 @@ iter_incremented:
          New<Phrase>(translator_->language(),
                      entry->IsPredictiveMatch() ? "completion" : "user_phrase",
                      start_, start_ + user_phrase_code_length, entry);
@@ -996,7 +996,7 @@ index aef62178..3b3483e6 100644
      candidate_->set_quality(std::exp(entry->weight) +
                              translator_->initial_quality() +
                              (entry->quality_len / full_code_length));
-@@ -661,6 +939,7 @@ iter_incremented:
+@@ -668,6 +946,7 @@ iter_incremented:
          New<Phrase>(translator_->language(),
                      entry->IsPredictiveMatch() ? "completion" : "phrase",
                      start_, start_ + phrase_code_length, entry);
@@ -1004,7 +1004,7 @@ index aef62178..3b3483e6 100644
      candidate_->set_quality(std::exp(entry->weight) +
                              translator_->initial_quality() +
                              (entry->quality_len / full_code_length));
-@@ -727,6 +1006,7 @@ deque<an<Sentence>> ScriptTranslation::MakeSentences(
+@@ -734,6 +1013,7 @@ deque<an<Sentence>> ScriptTranslation::MakeSentences(
    for (auto& sentence : sentences) {
      sentence->Offset(start_);
      sentence->set_syllabifier(syllabifier_);
@@ -1012,7 +1012,7 @@ index aef62178..3b3483e6 100644
    }
    return sentences;
  }
-@@ -740,6 +1020,7 @@ an<Sentence> ScriptTranslation::MakeSentence(Dictionary* dict,
+@@ -747,6 +1027,7 @@ an<Sentence> ScriptTranslation::MakeSentence(Dictionary* dict,
                                translator_->GetPrecedingText(start_))) {
      sentence->Offset(start_);
      sentence->set_syllabifier(syllabifier_);
@@ -1021,7 +1021,7 @@ index aef62178..3b3483e6 100644
    }
    return nullptr;
 diff --git a/src/rime/gear/script_translator.h b/src/rime/gear/script_translator.h
-index e5b60a7a..1e990dc9 100644
+index 64211df..9ac44bc 100644
 --- a/src/rime/gear/script_translator.h
 +++ b/src/rime/gear/script_translator.h
 @@ -11,6 +11,8 @@
@@ -1056,9 +1056,9 @@ index e5b60a7a..1e990dc9 100644
  
  class ScriptTranslator : public Translator,
                           public Memory,
-@@ -53,6 +69,17 @@ class ScriptTranslator : public Translator,
-   int max_word_length() const { return max_word_length_; }
+@@ -54,6 +70,17 @@ class ScriptTranslator : public Translator,
    int core_word_length() const;
+   Projection* canonicalizer() const { return canonicalizer_.get(); }
  
 +  //! Collect possible tab entries from the SyllableGraph
 +  RIME_DLL void CollectSyllableTabs(size_t start_pos,
@@ -1075,7 +1075,7 @@ index e5b60a7a..1e990dc9 100644
    int max_homophones_ = 1;
    int spelling_hints_ = 0;
 diff --git a/src/rime/gear/table_translator.cc b/src/rime/gear/table_translator.cc
-index 67bc2292..b7aed6d2 100644
+index 67bc229..b7aed6d 100644
 --- a/src/rime/gear/table_translator.cc
 +++ b/src/rime/gear/table_translator.cc
 @@ -16,7 +16,9 @@
@@ -1274,7 +1274,7 @@ index 67bc2292..b7aed6d2 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/table_translator.h b/src/rime/gear/table_translator.h
-index 7057ed4b..9aa0e034 100644
+index 7057ed4..9aa0e03 100644
 --- a/src/rime/gear/table_translator.h
 +++ b/src/rime/gear/table_translator.h
 @@ -37,6 +37,17 @@ class TableTranslator : public Translator,
@@ -1312,7 +1312,7 @@ index 7057ed4b..9aa0e034 100644
    size_t start_;
    size_t end_;
 diff --git a/src/rime/gear/translator_commons.cc b/src/rime/gear/translator_commons.cc
-index 7fc0f272..eadcf53e 100644
+index 7fc0f27..eadcf53 100644
 --- a/src/rime/gear/translator_commons.cc
 +++ b/src/rime/gear/translator_commons.cc
 @@ -177,4 +177,69 @@ bool TranslatorOptions::IsUserDictDisabledFor(const string& input) const {
@@ -1386,7 +1386,7 @@ index 7fc0f272..eadcf53e 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/translator_commons.h b/src/rime/gear/translator_commons.h
-index 6217e5a7..44cff5ca 100644
+index 6217e5a..44cff5c 100644
 --- a/src/rime/gear/translator_commons.h
 +++ b/src/rime/gear/translator_commons.h
 @@ -59,6 +59,7 @@ class PhraseSyllabifier {
@@ -1431,7 +1431,7 @@ index 6217e5a7..44cff5ca 100644
  
  #endif  // RIME_TRANSLATOR_COMMONS_H_
 diff --git a/src/rime/service.h b/src/rime/service.h
-index a69ae741..76438819 100644
+index a69ae74..7643881 100644
 --- a/src/rime/service.h
 +++ b/src/rime/service.h
 @@ -42,6 +42,7 @@ class Session {
@@ -1443,7 +1443,7 @@ index a69ae741..76438819 100644
    const string& commit_text() const { return commit_text_; }
  
 diff --git a/src/rime/translator.h b/src/rime/translator.h
-index 78ba7e22..4950fb46 100644
+index 78ba7e2..4950fb4 100644
 --- a/src/rime/translator.h
 +++ b/src/rime/translator.h
 @@ -15,10 +15,19 @@
@@ -1480,13 +1480,13 @@ index 78ba7e22..4950fb46 100644
  
   protected:
 diff --git a/src/rime_api.h b/src/rime_api.h
-index 2fccde0f..2e0c558c 100644
+index 5b8985d..9b0499d 100644
 --- a/src/rime_api.h
 +++ b/src/rime_api.h
-@@ -505,6 +505,47 @@ typedef struct RIME_FLAVORED(rime_api_t) {
-                                               size_t index);
- 
-   Bool (*change_page)(RimeSessionId session_id, Bool backward);
+@@ -521,6 +521,47 @@ typedef struct RIME_FLAVORED(rime_api_t) {
+                                 RimeCandidatePreview* preview);
+   //! free a RimeCandidatePreview filled by get_candidate_preview
+   Bool (*free_candidate_preview)(RimeCandidatePreview* preview);
 +
 +  // --- Input tab disambiguation API ---
 +
@@ -1532,7 +1532,7 @@ index 2fccde0f..2e0c558c 100644
  
  //! API entry
 diff --git a/src/rime_api_impl.h b/src/rime_api_impl.h
-index 30f4514f..422729c4 100644
+index 0fb6c69..b15618a 100644
 --- a/src/rime_api_impl.h
 +++ b/src/rime_api_impl.h
 @@ -17,6 +17,10 @@
@@ -1546,7 +1546,7 @@ index 30f4514f..422729c4 100644
  
  using namespace rime;
  
-@@ -1129,6 +1133,192 @@ void RimeGetStagingDirSecure(char* dir, size_t buffer_size);
+@@ -1174,6 +1178,192 @@ void RimeGetStagingDirSecure(char* dir, size_t buffer_size);
  void RimeGetSyncDirSecure(char* dir, size_t buffer_size);
  const char* RimeGetVersion();
  
@@ -1739,10 +1739,10 @@ index 30f4514f..422729c4 100644
  RIME_API RIME_FLAVORED(RimeApi) * RIME_FLAVORED(rime_get_api)() {
    static RIME_FLAVORED(RimeApi) s_api = {0};
    if (!s_api.data_size) {
-@@ -1232,6 +1422,13 @@ RIME_API RIME_FLAVORED(RimeApi) * RIME_FLAVORED(rime_get_api)() {
-     s_api.highlight_candidate_on_current_page =
-         &RimeHighlightCandidateOnCurrentPage;
+@@ -1279,6 +1469,13 @@ RIME_API RIME_FLAVORED(RimeApi) * RIME_FLAVORED(rime_get_api)() {
      s_api.change_page = &RimeChangePage;
+     s_api.get_candidate_preview = &RimeGetCandidatePreview;
+     s_api.free_candidate_preview = &RimeFreeCandidatePreview;
 +    // Input tab disambiguation API
 +    s_api.get_input_tabs = &RimeGetInputTabs;
 +    s_api.free_input_tabs = &RimeFreeInputTabs;
