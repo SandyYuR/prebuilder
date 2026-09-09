@@ -45,7 +45,7 @@ librimeRule = do
             cmd_ (Cwd librimePredictSrc) "git apply ../patches/librime-predict.patch"
             -- remove absolute path by __FILE__ macro; tabs selectable; refactor tabs
             cmd_ (Cwd src) "git checkout ."
-            cmd_ (Cwd src) "git clean -xdf"
+            cmd_ (Cwd src) "git clean -xdf test"
             cmd_ (Cwd src) "git apply ../patches/librime.patch"
             cmd_ (Cwd src) "git apply ../patches/librime-perf-syllabifier-cache-repeated-QuerySpelling-iterat.patch"
             cmd_ (Cwd src) "git apply ../patches/librime-perf-deploy-compile-independent-dictionaries-in-para.patch"
