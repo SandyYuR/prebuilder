@@ -50,7 +50,10 @@ librimeRule = do
             cmd_ (Cwd src) "git apply ../patches/librime-perf-syllabifier-cache-repeated-QuerySpelling-iterat.patch"
             cmd_ (Cwd src) "git apply ../patches/librime-perf-deploy-compile-independent-dictionaries-in-para.patch"
             -- in-memory sorted cache for user dictionary queries
-            cmd_ (Cwd src) "git apply ../patches/librime-userdict-cache.patch",
+            cmd_ (Cwd src) "git apply ../patches/librime-userdict-cache.patch"
+            -- dict file growth invalidates raw pointers after remap, which used
+            -- to corrupt the table/reverse/prism header ("invalid metadata")
+            cmd_ (Cwd src) "git apply ../patches/librime-fix-mapped-file-remap.patch",
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",

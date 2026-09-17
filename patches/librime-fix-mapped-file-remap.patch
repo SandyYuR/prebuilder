@@ -1,0 +1,363 @@
+diff --git a/src/rime/dict/mapped_file.cc b/src/rime/dict/mapped_file.cc
+index 5a5f75c0..a9af6ea5 100644
+--- a/src/rime/dict/mapped_file.cc
++++ b/src/rime/dict/mapped_file.cc
+@@ -139,21 +139,26 @@ bool MappedFile::Resize(size_t capacity) {
+ 
+ String* MappedFile::CreateString(const string& str) {
+   String* ret = Allocate<String>();
+-  if (ret && !str.empty()) {
+-    CopyString(str, ret);
+-  }
+-  return ret;
++  if (!ret)
++    return NULL;
++  // Allocate() 可能扩容并重新映射，须记下偏移以便随后重新定位
++  const ptrdiff_t ret_offset = OffsetOf(ret);
++  if (!str.empty() && !CopyString(str, ret))
++    return NULL;
++  return Rebase<String>(ret_offset);
+ }
+ 
+ bool MappedFile::CopyString(const string& src, String* dest) {
+   if (!dest)
+     return false;
++  // dest 位于映射区内，而 Allocate() 可能扩容并重新映射使其失效
++  const ptrdiff_t dest_offset = OffsetOf(dest);
+   size_t size = src.length() + 1;
+   char* ptr = Allocate<char>(size);
+   if (!ptr)
+     return false;
+   std::strncpy(ptr, src.c_str(), size);
+-  dest->data = ptr;
++  Rebase<String>(dest_offset)->data = ptr;
+   return true;
+ }
+ 
+diff --git a/src/rime/dict/mapped_file.h b/src/rime/dict/mapped_file.h
+index bd469eee..9fef79e8 100644
+--- a/src/rime/dict/mapped_file.h
++++ b/src/rime/dict/mapped_file.h
+@@ -9,6 +9,7 @@
+ 
+ #include <stdint.h>
+ #include <algorithm>
++#include <cstddef>
+ #include <cstring>
+ #include <rime_api.h>
+ #include <rime/common.h>
+@@ -105,6 +106,19 @@ class RIME_DLL MappedFile {
+   size_t capacity() const;
+   char* address() const;
+ 
++  // 空间不足时 Allocate() 会扩容文件并重新映射，映射基址随之改变，此前由
++  // Allocate()/CreateArray() 取得的裸指针全部失效，且不会被自动修正（文件内
++  // 的 OffsetPtr 因保存的是相对偏移而不受影响）。
++  // 因此构造文件时如需跨分配持有指针，应先用 OffsetOf() 记下偏移，待分配
++  // 结束后再用 Rebase() 取得当前有效的指针。ptr 必须位于映射区内。
++  ptrdiff_t OffsetOf(const void* ptr) const {
++    return static_cast<const char*>(ptr) - address();
++  }
++  template <class T>
++  T* Rebase(ptrdiff_t offset) const {
++    return reinterpret_cast<T*>(address() + offset);
++  }
++
+  public:
+   // noncpyable
+   MappedFile(const MappedFile&) = delete;
+diff --git a/src/rime/dict/prism.cc b/src/rime/dict/prism.cc
+index 146c23ba..25843009 100644
+--- a/src/rime/dict/prism.cc
++++ b/src/rime/dict/prism.cc
+@@ -209,6 +209,8 @@ bool Prism::Build(const Syllabary& syllabary,
+     return false;
+   }
+   std::memcpy(array, trie_->array(), image_size);
++  // 上一次分配可能扩容并重新映射，重新取得 metadata 指针
++  metadata = Find<prism::Metadata>(0);
+   metadata->double_array = array;
+   metadata->double_array_size = array_size;
+   // building spelling map
+@@ -223,19 +225,26 @@ bool Prism::Build(const Syllabary& syllabary,
+       LOG(ERROR) << "Error creating spelling map.";
+       return false;
+     }
+-    auto i = script->begin();
+-    auto item = spelling_map->begin();
+-    for (; i != script->end(); ++i, ++item) {
++    // 循环内还会继续分配，映射基址可能改变，因此只保留偏移
++    const ptrdiff_t spelling_map_offset = OffsetOf(spelling_map);
++    size_t item_pos = 0;
++    for (auto i = script->begin(); i != script->end(); ++i, ++item_pos) {
+       size_t list_size = i->second.size();
+-      item->size = list_size;
+-      item->at = Allocate<prism::SpellingDescriptor>(list_size);
+-      if (!item->at) {
++      auto descriptors = Allocate<prism::SpellingDescriptor>(list_size);
++      if (!descriptors) {
+         LOG(ERROR) << "Error creating spelling descriptors.";
+         return false;
+       }
+-      auto j = i->second.begin();
+-      auto desc = item->begin();
+-      for (; j != i->second.end(); ++j, ++desc) {
++      auto fresh_map = Rebase<prism::SpellingMap>(spelling_map_offset);
++      fresh_map->at[item_pos].size = list_size;
++      fresh_map->at[item_pos].at = descriptors;
++      size_t desc_pos = 0;
++      for (auto j = i->second.begin(); j != i->second.end(); ++j, ++desc_pos) {
++        // CopyString() 也会分配，可能扩容并重新映射，故每轮重新取得指针
++        auto desc =
++            &Rebase<prism::SpellingMap>(spelling_map_offset)
++                 ->at[item_pos]
++                 .at[desc_pos];
+         desc->syllable_id = syllable_to_id[j->str];
+         // 打包寫入 type + is_correction
+         int32_t packed_type = static_cast<int32_t>(j->properties.type);
+@@ -251,10 +260,14 @@ bool Prism::Build(const Syllabary& syllabary,
+         }
+       }
+     }
+-    metadata->spelling_map = spelling_map;
+-    spelling_map_ = spelling_map;
++    // 上述分配可能已扩容并重新映射
++    auto fresh_map = Rebase<prism::SpellingMap>(spelling_map_offset);
++    metadata = Find<prism::Metadata>(0);
++    metadata->spelling_map = fresh_map;
++    spelling_map_ = fresh_map;
+   }
+   // at last, complete the metadata
++  metadata = Find<prism::Metadata>(0);
+   std::strncpy(metadata->format, kPrismFormat,
+                prism::Metadata::kFormatMaxLength);
+   return true;
+diff --git a/src/rime/dict/reverse_lookup_dictionary.cc b/src/rime/dict/reverse_lookup_dictionary.cc
+index 4e045912..78f5593e 100644
+--- a/src/rime/dict/reverse_lookup_dictionary.cc
++++ b/src/rime/dict/reverse_lookup_dictionary.cc
+@@ -157,6 +157,8 @@ bool ReverseDb::Build(DictSettings* settings,
+     }
+   }
+ 
++  // 以下每次分配都可能扩容并重新映射，因此写入前重新取得 metadata 指针
++  metadata_ = Find<reverse::Metadata>(0);
+   auto entries = Allocate<StringId>(entry_count);
+   if (!entries) {
+     return false;
+@@ -164,6 +166,7 @@ bool ReverseDb::Build(DictSettings* settings,
+   for (size_t i = 0; i < entry_count; ++i) {
+     entries[key_ids[i]] = value_ids[i];
+   }
++  metadata_ = Find<reverse::Metadata>(0);
+   metadata_->index.size = entry_count;
+   metadata_->index.at = entries;
+ 
+@@ -174,6 +177,7 @@ bool ReverseDb::Build(DictSettings* settings,
+     return false;
+   }
+   key_trie_builder.Dump(key_trie_image, key_trie_image_size);
++  metadata_ = Find<reverse::Metadata>(0);
+   metadata_->key_trie = key_trie_image;
+   metadata_->key_trie_size = key_trie_image_size;
+ 
+@@ -184,10 +188,12 @@ bool ReverseDb::Build(DictSettings* settings,
+     return false;
+   }
+   value_trie_builder.Dump(value_trie_image, value_trie_image_size);
++  metadata_ = Find<reverse::Metadata>(0);
+   metadata_->value_trie = value_trie_image;
+   metadata_->value_trie_size = value_trie_image_size;
+ 
+   // at last, complete the metadata
++  metadata_ = Find<reverse::Metadata>(0);
+   std::strncpy(metadata_->format, kReverseFormat,
+                reverse::Metadata::kFormatMaxLength);
+   return true;
+diff --git a/src/rime/dict/table.cc b/src/rime/dict/table.cc
+index af7e70b3..0fa167d6 100644
+--- a/src/rime/dict/table.cc
++++ b/src/rime/dict/table.cc
+@@ -251,6 +251,8 @@ bool Table::OnBuildFinish() {
+     return false;
+   }
+   string_table_builder_->Dump(image, image_size);
++  // 字符串表通常是最大的一块，这里的 Allocate() 极易触发扩容并重新映射
++  metadata_ = Find<table::Metadata>(0);
+   metadata_->string_table = image;
+   metadata_->string_table_size = image_size;
+   return true;
+@@ -369,6 +371,8 @@ bool Table::Build(const Syllabary& syllabary,
+       AddString(syllable, &syllabary_->at[i++], 0.0);
+     }
+   }
++  // 创建 syllabary 时可能已扩容并重新映射，重新取得 metadata 指针
++  metadata_ = Find<table::Metadata>(0);
+   metadata_->syllabary = syllabary_;
+ 
+   LOG(INFO) << "creating table index.";
+@@ -377,6 +381,8 @@ bool Table::Build(const Syllabary& syllabary,
+     LOG(ERROR) << "Error creating table index.";
+     return false;
+   }
++  // BuildIndex() 内部可能扩容并重新映射，重新取得 metadata 指针
++  metadata_ = Find<table::Metadata>(0);
+   metadata_->index = index_;
+ 
+   if (!OnBuildFinish()) {
+@@ -384,6 +390,9 @@ bool Table::Build(const Syllabary& syllabary,
+   }
+ 
+   // at last, complete the metadata
++  // OnBuildFinish() 可能扩容并重新映射；format 是文件头校验字段，
++  // 必须写入当前映射，否则文件将无法再次载入（invalid metadata）
++  metadata_ = Find<table::Metadata>(0);
+   std::strncpy(metadata_->format, kTableFormatLatest,
+                table::Metadata::kFormatMaxLength);
+   return true;
+@@ -401,12 +410,16 @@ table::HeadIndex* Table::BuildHeadIndex(const Vocabulary& vocabulary,
+   if (!index) {
+     return NULL;
+   }
++  // 后续分配可能扩容并重新映射，届时 index 失效，因此只保留偏移
++  const ptrdiff_t index_offset = OffsetOf(index);
+   for (const auto& v : vocabulary) {
+     int syllable_id = v.first;
+-    auto& node(index->at[syllable_id]);
+     const auto& entries(v.second.entries);
+-    if (!BuildEntryList(entries, &node.entries)) {
+-      return NULL;
++    {
++      auto head_index = Rebase<table::HeadIndex>(index_offset);
++      if (!BuildEntryList(entries, &head_index->at[syllable_id].entries)) {
++        return NULL;
++      }
+     }
+     if (v.second.next_level) {
+       Code code;
+@@ -415,10 +428,13 @@ table::HeadIndex* Table::BuildHeadIndex(const Vocabulary& vocabulary,
+       if (!next_level_index) {
+         return NULL;
+       }
+-      node.next_level = reinterpret_cast<table::PhraseIndex*>(next_level_index);
++      // 上一次分配可能已使数组移动
++      auto head_index = Rebase<table::HeadIndex>(index_offset);
++      head_index->at[syllable_id].next_level =
++          reinterpret_cast<table::PhraseIndex*>(next_level_index);
+     }
+   }
+-  return index;
++  return Rebase<table::HeadIndex>(index_offset);
+ }
+ 
+ table::TrunkIndex* Table::BuildTrunkIndex(const Code& prefix,
+@@ -427,35 +443,44 @@ table::TrunkIndex* Table::BuildTrunkIndex(const Code& prefix,
+   if (!index) {
+     return NULL;
+   }
++  // 后续分配可能扩容并重新映射，届时 index 失效，因此只保留偏移
++  const ptrdiff_t index_offset = OffsetOf(index);
+   size_t count = 0;
+   for (const auto& v : vocabulary) {
+     int syllable_id = v.first;
+-    auto& node(index->at[count++]);
+-    node.key = syllable_id;
+-    const auto& entries(v.second.entries);
+-    if (!BuildEntryList(entries, &node.entries)) {
+-      return NULL;
++    const size_t node_pos = count++;
++    {
++      auto trunk_index = Rebase<table::TrunkIndex>(index_offset);
++      if (!BuildEntryList(v.second.entries,
++                          &trunk_index->at[node_pos].entries)) {
++        return NULL;
++      }
++      // BuildEntryList() 内部可能扩容并重新映射
++      Rebase<table::TrunkIndex>(index_offset)->at[node_pos].key = syllable_id;
+     }
+     if (v.second.next_level) {
+       Code code(prefix);
+       code.push_back(syllable_id);
++      table::PhraseIndex* next_level = NULL;
+       if (code.size() < Code::kIndexCodeMaxLength) {
+         auto next_level_index = BuildTrunkIndex(code, *v.second.next_level);
+         if (!next_level_index) {
+           return NULL;
+         }
+-        node.next_level =
+-            reinterpret_cast<table::PhraseIndex*>(next_level_index);
++        next_level = reinterpret_cast<table::PhraseIndex*>(next_level_index);
+       } else {
+         auto tail_index = BuildTailIndex(code, *v.second.next_level);
+         if (!tail_index) {
+           return NULL;
+         }
+-        node.next_level = reinterpret_cast<table::PhraseIndex*>(tail_index);
++        next_level = reinterpret_cast<table::PhraseIndex*>(tail_index);
+       }
++      // 上一次分配可能已使数组移动
++      Rebase<table::TrunkIndex>(index_offset)->at[node_pos].next_level =
++          next_level;
+     }
+   }
+-  return index;
++  return Rebase<table::TrunkIndex>(index_offset);
+ }
+ 
+ table::TailIndex* Table::BuildTailIndex(const Code& prefix,
+@@ -469,24 +494,30 @@ table::TailIndex* Table::BuildTailIndex(const Code& prefix,
+   if (!index) {
+     return NULL;
+   }
++  // 后续分配可能扩容并重新映射，届时 index 失效，因此只保留偏移
++  const ptrdiff_t index_offset = OffsetOf(index);
+   size_t count = 0;
+   for (const auto& src : page.entries) {
+     DLOG(INFO) << "count: " << count;
+     DLOG(INFO) << "entry: " << src->text;
+-    auto& dest(index->at[count++]);
+     size_t extra_code_length = src->code.size() - Code::kIndexCodeMaxLength;
+     DLOG(INFO) << "extra code length: " << extra_code_length;
+-    dest.extra_code.size = extra_code_length;
+-    dest.extra_code.at = Allocate<SyllableId>(extra_code_length);
+-    if (!dest.extra_code.at) {
++    const size_t entry_pos = count++;
++    // 每个条目都要分配额外编码，这一步可能移动整个数组
++    auto extra_code = Allocate<SyllableId>(extra_code_length);
++    if (!extra_code) {
+       LOG(ERROR) << "Error creating code sequence; file size: " << file_size();
+       return NULL;
+     }
++    auto tail_index = Rebase<table::TailIndex>(index_offset);
++    auto& dest(tail_index->at[entry_pos]);
++    dest.extra_code.size = extra_code_length;
++    dest.extra_code.at = extra_code;
+     std::copy(src->code.begin() + Code::kIndexCodeMaxLength, src->code.end(),
+               dest.extra_code.begin());
+     BuildEntry(*src, &dest.entry);
+   }
+-  return index;
++  return Rebase<table::TailIndex>(index_offset);
+ }
+ 
+ Array<table::Entry>* Table::BuildEntryArray(const ShortDictEntryList& entries) {
+@@ -506,12 +537,16 @@ bool Table::BuildEntryList(const ShortDictEntryList& src,
+                            List<table::Entry>* dest) {
+   if (!dest)
+     return false;
+-  dest->size = src.size();
+-  dest->at = Allocate<table::Entry>(src.size());
+-  if (!dest->at) {
++  // dest 位于映射区内，而下面的分配可能扩容并重新映射使其失效
++  const ptrdiff_t dest_offset = OffsetOf(dest);
++  auto entries = Allocate<table::Entry>(src.size());
++  if (!entries) {
+     LOG(ERROR) << "Error creating table entries; file size: " << file_size();
+     return false;
+   }
++  dest = Rebase<List<table::Entry>>(dest_offset);
++  dest->size = src.size();
++  dest->at = entries;
+   size_t i = 0;
+   for (auto d = src.begin(); d != src.end(); ++d, ++i) {
+     if (!BuildEntry(**d, &dest->at[i]))
