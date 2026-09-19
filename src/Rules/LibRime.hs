@@ -53,7 +53,12 @@ librimeRule = do
             cmd_ (Cwd src) "git apply ../patches/librime-userdict-cache.patch"
             -- dict file growth invalidates raw pointers after remap, which used
             -- to corrupt the table/reverse/prism header ("invalid metadata")
-            cmd_ (Cwd src) "git apply ../patches/librime-fix-mapped-file-remap.patch",
+            cmd_ (Cwd src) "git apply ../patches/librime-fix-mapped-file-remap.patch"
+            -- delete_notifier is multicast; refreshing the composition inside a
+            -- listener made later listeners delete a second, unrelated word
+            -- ("forget one word, lose two"). Defer the rebuild to the end of the
+            -- dispatch instead.
+            cmd_ (Cwd src) "git apply ../patches/librime-defer-composition-refresh-on-delete.patch",
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",
