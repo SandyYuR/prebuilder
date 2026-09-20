@@ -1,15 +1,20 @@
 diff --git a/src/rime/dict/rewrite_pack.cc b/src/rime/dict/rewrite_pack.cc
 new file mode 100644
-index 00000000..b428e6c2
+index 0000000..7d7ad1e
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.cc
-@@ -0,0 +1,1450 @@
+@@ -0,0 +1,1537 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
 +//
-+#include <rime/dict/rewrite_pack.h>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#endif
 +
++#include <rime/dict/rewrite_pack.h>
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -27,45 +32,38 @@ index 00000000..b428e6c2
 +#include <unordered_map>
 +#include <unordered_set>
 +#include <utility>
-+
-+#include <marisa.h>
-+#include <utf8.h>
-+
++#include <darts.h>
 +#include <rime/dict/mapped_file.h>
-+
 +#ifdef _WIN32
-+#ifndef NOMINMAX
-+#define NOMINMAX
-+#endif
 +#include <windows.h>
-+#ifdef min
-+#undef min
-+#endif
-+#ifdef max
-+#undef max
-+#endif
 +#endif
 +
 +namespace rime {
 +namespace {
 +
-+constexpr char kMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'P', '4'};
-+constexpr uint32_t kFormatVersion = 4;
++constexpr char kMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'P', '5'};
++constexpr uint32_t kFormatVersion = 5;
 +constexpr uint32_t kHeaderSize = 48;
 +constexpr uint32_t kSectionRecordSize = 24;
-+constexpr uint32_t kStageRecordSize = 64;
++constexpr uint32_t kStageRecordSize = 72;
 +constexpr uint32_t kKeyIndexRecordSize = 8;
 +constexpr uint32_t kStageFlagHasPreedit = 1U << 0;
-+constexpr uint32_t kStageFlagHasStarterFilter = 1U << 1;
-+constexpr uint32_t kKnownStageFlags =
-+    kStageFlagHasPreedit | kStageFlagHasStarterFilter;
-+constexpr size_t kStarterFilterBitCount = 1U << 16;
-+constexpr size_t kStarterFilterSize = kStarterFilterBitCount / 8;
-+constexpr uint64_t kBuildIdRevision = 2;
++constexpr uint32_t kKnownStageFlags = kStageFlagHasPreedit;
++constexpr uint64_t kBuildIdRevision = 1;
 +constexpr size_t kInvalidIndex = std::numeric_limits<size_t>::max();
 +
-+static_assert((kStarterFilterBitCount & (kStarterFilterBitCount - 1)) == 0,
-+              "starter filter size must be a power of two");
++constexpr uint32_t kUnicodeScalarLimit = 0x110000;
++constexpr uint32_t kCharPageShift = 8;
++constexpr uint32_t kCharPageSize = 1U << kCharPageShift;
++constexpr uint32_t kCharPageMask = kCharPageSize - 1;
++constexpr uint32_t kCharDirectoryEntries = kUnicodeScalarLimit / kCharPageSize;
++constexpr uint32_t kDispatchPhraseStarter = 1U << 31;
++constexpr uint32_t kDispatchKeyMask = kDispatchPhraseStarter - 1;
++
++static_assert(kCharDirectoryEntries <= std::numeric_limits<uint16_t>::max(),
++              "character dispatch directory must fit uint16_t page ids");
++static_assert(sizeof(uint16_t) == 2 && sizeof(uint32_t) == 4,
++              "RWP5 dispatch table requires 16-bit and 32-bit integers");
 +
 +struct SectionRecord {
 +  uint64_t name_offset = 0;
@@ -75,15 +73,17 @@ index 00000000..b428e6c2
 +};
 +
 +struct StageRecord {
-+  uint64_t trie_offset = 0;
-+  uint64_t trie_size = 0;
++  uint64_t phrase_trie_offset = 0;
++  uint64_t phrase_trie_size = 0;
++  uint64_t char_directory_offset = 0;
++  uint64_t char_pages_offset = 0;
 +  uint64_t key_index_offset = 0;
-+  uint32_t key_count = 0;
-+  uint32_t flags = 0;
 +  uint64_t value_pool_offset = 0;
 +  uint64_t value_pool_size = 0;
-+  uint64_t starter_filter_offset = 0;
-+  uint64_t starter_filter_size = 0;
++  uint32_t char_page_count = 0;
++  uint32_t key_count = 0;
++  uint32_t flags = 0;
++  uint32_t phrase_key_count = 0;
 +};
 +
 +inline uint32_t ReadU32(const char* p) {
@@ -147,26 +147,81 @@ index 00000000..b428e6c2
 +  return value <= std::numeric_limits<uint32_t>::max();
 +}
 +
-+size_t NextUtf8CharSize(const char* begin, const char* end) {
-+  if (!begin || !end || begin >= end) {
-+    return 0;
-+  }
-+  const char* next = begin;
-+  try {
-+    utf8::next(next, end);
-+  } catch (const std::exception&) {
-+    // Preserve malformed input byte-for-byte rather than reading past the
-+    // candidate buffer. Normal Rime text takes the fast, non-throwing path.
-+    return 1;
-+  }
-+  if (next <= begin || next > end) {
-+    return 1;
-+  }
-+  return static_cast<size_t>(next - begin);
++bool ValidateSectionTable(uint32_t section_count,
++                          uint64_t section_table_offset,
++                          uint64_t file_size) {
++  return section_count != 0 && section_table_offset >= kHeaderSize &&
++         InRange(section_table_offset,
++                 static_cast<uint64_t>(section_count) * kSectionRecordSize,
++                 file_size);
 +}
 +
-+size_t ValidUtf8CharSize(const char* begin, const char* end) {
-+  if (!begin || !end || begin >= end) {
++SectionRecord ReadSectionRecord(const char* p) {
++  SectionRecord record;
++  record.name_offset = ReadU64(p);
++  record.name_size = ReadU32(p + 8);
++  record.stage_count = ReadU32(p + 12);
++  record.stage_table_offset = ReadU64(p + 16);
++  return record;
++}
++
++bool ValidateSectionRecord(const SectionRecord& record, uint64_t file_size) {
++  return record.name_size != 0 && record.stage_count == 1 &&
++         InRange(record.name_offset, record.name_size, file_size) &&
++         InRange(record.stage_table_offset, kStageRecordSize, file_size);
++}
++
++StageRecord ReadStageRecord(const char* p) {
++  StageRecord record;
++  record.phrase_trie_offset = ReadU64(p);
++  record.phrase_trie_size = ReadU64(p + 8);
++  record.char_directory_offset = ReadU64(p + 16);
++  record.char_pages_offset = ReadU64(p + 24);
++  record.key_index_offset = ReadU64(p + 32);
++  record.value_pool_offset = ReadU64(p + 40);
++  record.value_pool_size = ReadU64(p + 48);
++  record.char_page_count = ReadU32(p + 56);
++  record.key_count = ReadU32(p + 60);
++  record.flags = ReadU32(p + 64);
++  record.phrase_key_count = ReadU32(p + 68);
++  return record;
++}
++
++bool ValidateStageRecord(const StageRecord& record, uint64_t file_size) {
++  const uint64_t char_directory_size =
++      static_cast<uint64_t>(kCharDirectoryEntries) * sizeof(uint16_t);
++  const uint64_t char_pages_size =
++      static_cast<uint64_t>(record.char_page_count) * kCharPageSize *
++      sizeof(uint32_t);
++  const bool has_phrase_trie = record.phrase_key_count != 0;
++
++  return record.key_count != 0 && record.key_count <= kDispatchKeyMask &&
++         record.char_page_count != 0 &&
++         record.char_page_count <= kCharDirectoryEntries &&
++         record.value_pool_size != 0 &&
++         (record.flags & ~kKnownStageFlags) == 0 &&
++         (record.char_directory_offset % alignof(uint16_t)) == 0 &&
++         (record.char_pages_offset % alignof(uint32_t)) == 0 &&
++         InRange(record.char_directory_offset, char_directory_size,
++                 file_size) &&
++         InRange(record.char_pages_offset, char_pages_size, file_size) &&
++         InRange(record.key_index_offset,
++                 static_cast<uint64_t>(record.key_count) * kKeyIndexRecordSize,
++                 file_size) &&
++         InRange(record.value_pool_offset, record.value_pool_size, file_size) &&
++         ((!has_phrase_trie && record.phrase_trie_offset == 0 &&
++           record.phrase_trie_size == 0) ||
++          (has_phrase_trie && record.phrase_trie_size != 0 &&
++           (record.phrase_trie_offset % alignof(uint32_t)) == 0 &&
++           (record.phrase_trie_size % sizeof(uint32_t)) == 0 &&
++           InRange(record.phrase_trie_offset, record.phrase_trie_size,
++                   file_size)));
++}
++
++size_t DecodeUtf8Scalar(const char* begin,
++                        const char* end,
++                        uint32_t* code_point) {
++  if (!begin || !end || !code_point || begin >= end) {
 +    return 0;
 +  }
 +
@@ -175,36 +230,69 @@ index 00000000..b428e6c2
 +  const unsigned char first = p[0];
 +
 +  if (first <= 0x7f) {
++    *code_point = first;
 +    return 1;
 +  }
 +  if (first >= 0xc2 && first <= 0xdf) {
-+    return remaining >= 2 && (p[1] & 0xc0) == 0x80 ? 2 : 0;
++    if (remaining < 2 || (p[1] & 0xc0) != 0x80) {
++      return 0;
++    }
++    *code_point = (static_cast<uint32_t>(first & 0x1f) << 6) |
++                  static_cast<uint32_t>(p[1] & 0x3f);
++    return 2;
 +  }
 +  if (first >= 0xe0 && first <= 0xef) {
-+    if (remaining < 3 || (p[2] & 0xc0) != 0x80) {
++    if (remaining < 3 || (p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80) {
 +      return 0;
 +    }
-+    if (first == 0xe0) {
-+      return p[1] >= 0xa0 && p[1] <= 0xbf ? 3 : 0;
++    if ((first == 0xe0 && p[1] < 0xa0) || (first == 0xed && p[1] > 0x9f)) {
++      return 0;
 +    }
-+    if (first == 0xed) {
-+      return p[1] >= 0x80 && p[1] <= 0x9f ? 3 : 0;
-+    }
-+    return (p[1] & 0xc0) == 0x80 ? 3 : 0;
++    *code_point = (static_cast<uint32_t>(first & 0x0f) << 12) |
++                  (static_cast<uint32_t>(p[1] & 0x3f) << 6) |
++                  static_cast<uint32_t>(p[2] & 0x3f);
++    return 3;
 +  }
 +  if (first >= 0xf0 && first <= 0xf4) {
-+    if (remaining < 4 || (p[2] & 0xc0) != 0x80 || (p[3] & 0xc0) != 0x80) {
++    if (remaining < 4 || (p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80 ||
++        (p[3] & 0xc0) != 0x80) {
 +      return 0;
 +    }
-+    if (first == 0xf0) {
-+      return p[1] >= 0x90 && p[1] <= 0xbf ? 4 : 0;
++    if ((first == 0xf0 && p[1] < 0x90) || (first == 0xf4 && p[1] > 0x8f)) {
++      return 0;
 +    }
-+    if (first == 0xf4) {
-+      return p[1] >= 0x80 && p[1] <= 0x8f ? 4 : 0;
-+    }
-+    return (p[1] & 0xc0) == 0x80 ? 4 : 0;
++    *code_point = (static_cast<uint32_t>(first & 0x07) << 18) |
++                  (static_cast<uint32_t>(p[1] & 0x3f) << 12) |
++                  (static_cast<uint32_t>(p[2] & 0x3f) << 6) |
++                  static_cast<uint32_t>(p[3] & 0x3f);
++    return 4;
 +  }
 +  return 0;
++}
++
++bool ValidateUtf8Key(std::string_view key,
++                     uint32_t* first_code_point,
++                     size_t* first_char_size) {
++  if (key.empty() || !first_code_point || !first_char_size) {
++    return false;
++  }
++
++  const char* current = key.data();
++  const char* end = current + key.size();
++  *first_char_size = DecodeUtf8Scalar(current, end, first_code_point);
++  if (*first_char_size == 0) {
++    return false;
++  }
++  current += *first_char_size;
++  while (current < end) {
++    uint32_t code_point = 0;
++    const size_t char_size = DecodeUtf8Scalar(current, end, &code_point);
++    if (char_size == 0) {
++      return false;
++    }
++    current += char_size;
++  }
++  return true;
 +}
 +
 +std::atomic<uint64_t> g_temp_counter{0};
@@ -254,9 +342,6 @@ index 00000000..b428e6c2
 +  }
 +
 +#ifdef _WIN32
-+  // std::filesystem::rename is not required to replace an existing file on
-+  // Windows. MoveFileEx does the replacement without deleting the old pack
-+  // first, so a failed install leaves the previous valid pack intact.
 +  if (MoveFileExW(temporary_path.wstring().c_str(),
 +                  output_path.wstring().c_str(),
 +                  MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -325,23 +410,6 @@ index 00000000..b428e6c2
 +  return hash;
 +}
 +
-+size_t StarterFilterBit(const char* data, size_t size, uint64_t seed) {
-+  const uint64_t hash = HashBytes(seed, data, size);
-+  return static_cast<size_t>(hash & (kStarterFilterBitCount - 1));
-+}
-+
-+void AddStarterFilterEntry(
-+    std::array<uint8_t, kStarterFilterSize>* starter_filter,
-+    const char* data,
-+    size_t size) {
-+  constexpr uint64_t kSeeds[] = {1469598103934665603ULL,
-+                                 7809847782465536322ULL};
-+  for (const uint64_t seed : kSeeds) {
-+    const size_t bit = StarterFilterBit(data, size, seed);
-+    (*starter_filter)[bit >> 3] |= static_cast<uint8_t>(1U << (bit & 7));
-+  }
-+}
-+
 +uint64_t HashU64(uint64_t hash, uint64_t value) {
 +  std::array<char, 8> bytes{};
 +  for (size_t i = 0; i < bytes.size(); ++i) {
@@ -395,11 +463,8 @@ index 00000000..b428e6c2
 +  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
 +  const uint32_t section_count = ReadU32(header.data() + 12);
 +  const uint64_t section_table_offset = ReadU64(header.data() + 16);
-+  if (ec || ReadU64(header.data() + 40) != actual_size || section_count == 0 ||
-+      section_table_offset < kHeaderSize ||
-+      !InRange(section_table_offset,
-+               static_cast<uint64_t>(section_count) * kSectionRecordSize,
-+               actual_size)) {
++  if (ec || ReadU64(header.data() + 40) != actual_size ||
++      !ValidateSectionTable(section_count, section_table_offset, actual_size)) {
 +    return false;
 +  }
 +
@@ -416,45 +481,100 @@ index 00000000..b428e6c2
 +};
 +
 +struct StageView {
-+  marisa::Trie trie;
++  Darts::DoubleArray phrase_trie;
++  const uint16_t* char_directory = nullptr;
++  const uint32_t* char_pages = nullptr;
 +  const char* key_index = nullptr;
 +  const char* value_pool = nullptr;
 +  const char* value_pool_end = nullptr;
-+  const uint8_t* starter_filter = nullptr;
-+  size_t starter_filter_size = 0;
++  uint32_t char_page_count = 0;
 +  uint32_t key_count = 0;
++  uint32_t phrase_key_count = 0;
 +  uint32_t flags = 0;
 +
-+  bool MayStartKey(const char* data, size_t size) const {
-+    if (!starter_filter || starter_filter_size != kStarterFilterSize) {
-+      return true;
-+    }
-+    constexpr uint64_t kSeeds[] = {1469598103934665603ULL,
-+                                   7809847782465536322ULL};
-+    for (const uint64_t seed : kSeeds) {
-+      const size_t bit = StarterFilterBit(data, size, seed);
-+      if ((starter_filter[bit >> 3] & static_cast<uint8_t>(1U << (bit & 7))) ==
-+          0) {
-+        return false;
-+      }
-+    }
-+    return true;
-+  }
-+
-+  size_t SkipUnmatchable(const char* begin, const char* end) const {
-+    if (!starter_filter || !begin || !end || begin >= end) {
++  uint32_t Dispatch(uint32_t code_point) const {
++    if (!char_directory || !char_pages || code_point >= kUnicodeScalarLimit) {
 +      return 0;
 +    }
-+
-+    const char* current = begin;
-+    while (current < end) {
-+      const size_t char_size = ValidUtf8CharSize(current, end);
-+      if (char_size == 0 || MayStartKey(current, char_size)) {
-+        break;
-+      }
-+      current += char_size;
++    const uint16_t page_id = char_directory[code_point >> kCharPageShift];
++    if (page_id == 0 || page_id > char_page_count) {
++      return 0;
 +    }
-+    return static_cast<size_t>(current - begin);
++    const size_t page_offset = static_cast<size_t>(page_id - 1) * kCharPageSize;
++    return char_pages[page_offset + (code_point & kCharPageMask)];
++  }
++
++  uint32_t DispatchAt(const char* current,
++                      const char* end,
++                      size_t* char_size) const {
++    if (!char_size) {
++      return 0;
++    }
++    uint32_t code_point = 0;
++    *char_size = DecodeUtf8Scalar(current, end, &code_point);
++    if (*char_size == 0) {
++      *char_size = 1;
++      return 0;
++    }
++    return Dispatch(code_point);
++  }
++
++  bool FindLongestPhrase(const char* current,
++                         const char* end,
++                         Darts::DoubleArray::result_pair_type* longest) const {
++    if (!current || !end || !longest || current >= end ||
++        phrase_key_count == 0) {
++      return false;
++    }
++
++    *longest = {};
++    const size_t remaining = static_cast<size_t>(end - current);
++    const size_t max_possible_results =
++        std::min(remaining, static_cast<size_t>(phrase_key_count));
++    if (max_possible_results == 0) {
++      return false;
++    }
++
++    constexpr size_t kInlinePrefixResults = 8;
++    std::array<Darts::DoubleArray::result_pair_type, kInlinePrefixResults>
++        inline_results{};
++
++    auto select_longest = [&](const auto* results, size_t count) {
++      for (size_t i = 0; i < count; ++i) {
++        if (results[i].length > longest->length) {
++          *longest = results[i];
++        }
++      }
++    };
++
++    size_t capacity = inline_results.size();
++    size_t match_count = phrase_trie.commonPrefixSearch(
++        current, inline_results.data(), capacity, remaining);
++    select_longest(inline_results.data(), std::min(match_count, capacity));
++
++    if (match_count < capacity || capacity >= max_possible_results) {
++      return longest->value > 0;
++    }
++
++    vector<Darts::DoubleArray::result_pair_type> results;
++    while (capacity < max_possible_results) {
++      size_t next_capacity = capacity * 2;
++      if (match_count > next_capacity) {
++        next_capacity = match_count;
++      }
++      capacity = std::min(next_capacity, max_possible_results);
++      results.resize(capacity);
++
++      match_count = phrase_trie.commonPrefixSearch(current, results.data(),
++                                                   capacity, remaining);
++      *longest = {};
++      select_longest(results.data(), std::min(match_count, capacity));
++
++      if (match_count < capacity || capacity >= max_possible_results) {
++        return longest->value > 0;
++      }
++    }
++    return longest->value > 0;
 +  }
 +
 +  static bool ReadValue(const char** cursor,
@@ -511,28 +631,59 @@ index 00000000..b428e6c2
 +    return true;
 +  }
 +
-+  bool Lookup(std::string_view text,
-+              marisa::Agent* agent,
-+              vector<string>* values) const {
-+    if (!agent || !values) {
++  bool FindExactKey(std::string_view text, size_t* key_id) const {
++    if (!key_id || text.empty()) {
++      return false;
++    }
++
++    uint32_t code_point = 0;
++    const size_t first_size =
++        DecodeUtf8Scalar(text.data(), text.data() + text.size(), &code_point);
++    if (first_size == 0) {
++      return false;
++    }
++
++    const uint32_t dispatch = Dispatch(code_point);
++    if (first_size == text.size()) {
++      const uint32_t encoded_key_id = dispatch & kDispatchKeyMask;
++      if (encoded_key_id == 0) {
++        return false;
++      }
++      *key_id = static_cast<size_t>(encoded_key_id - 1);
++      return *key_id < key_count;
++    }
++
++    if ((dispatch & kDispatchPhraseStarter) == 0 || phrase_key_count == 0) {
++      return false;
++    }
++
++    Darts::DoubleArray::result_pair_type match{};
++    phrase_trie.exactMatchSearch(text.data(), match, text.size());
++    if (match.value <= 0 || match.length != text.size()) {
++      return false;
++    }
++    *key_id = static_cast<size_t>(match.value - 1);
++    return *key_id < key_count;
++  }
++
++  bool Lookup(std::string_view text, vector<string>* values) const {
++    if (!values) {
 +      return false;
 +    }
 +    values->clear();
-+    agent->set_query(text.data(), text.size());
-+    if (!trie.lookup(*agent)) {
++
++    size_t key_id = 0;
++    if (!FindExactKey(text, &key_id)) {
 +      return false;
 +    }
 +
 +    const char* cursor = nullptr;
 +    const char* end = nullptr;
 +    uint32_t value_count = 0;
-+    if (!GetValueList(agent->key().id(), &cursor, &end, &value_count)) {
++    if (!GetValueList(key_id, &cursor, &end, &value_count)) {
 +      return false;
 +    }
 +
-+    // Single-key lookup preserves every value in source order. Reserve only a
-+    // small initial capacity so a damaged pack cannot force a huge allocation
-+    // before the bounded value decoder has inspected the pool.
 +    values->reserve(std::min<uint32_t>(value_count, 16));
 +    for (uint32_t i = 0; i < value_count; ++i) {
 +      std::string_view preedit;
@@ -547,21 +698,21 @@ index 00000000..b428e6c2
 +  }
 +
 +  bool LookupWithPreedit(std::string_view text,
-+                         marisa::Agent* agent,
 +                         vector<RewriteResult>* values) const {
-+    if (!agent || !values) {
++    if (!values) {
 +      return false;
 +    }
 +    values->clear();
-+    agent->set_query(text.data(), text.size());
-+    if (!trie.lookup(*agent)) {
++
++    size_t key_id = 0;
++    if (!FindExactKey(text, &key_id)) {
 +      return false;
 +    }
 +
 +    const char* cursor = nullptr;
 +    const char* end = nullptr;
 +    uint32_t value_count = 0;
-+    if (!GetValueList(agent->key().id(), &cursor, &end, &value_count)) {
++    if (!GetValueList(key_id, &cursor, &end, &value_count)) {
 +      return false;
 +    }
 +
@@ -588,24 +739,32 @@ index 00000000..b428e6c2
 +    }
 +
 +    std::string_view preedit;
-+    if (!ReadStoredValue(&cursor, end, &preedit, value)) {
-+      return false;
-+    }
-+    return true;
++    return ReadStoredValue(&cursor, end, &preedit, value);
 +  }
 +
-+  bool ConvertSentence(const string& text, string* result) const {
++  bool ConvertSentence(std::string_view text, string* result) const {
 +    result->clear();
 +
 +    bool changed = false;
 +    size_t pos = 0;
-+    marisa::Agent agent;
++    const char* const text_begin = text.data();
++    const char* const text_end = text_begin + text.size();
 +
 +    while (pos < text.size()) {
-+      const char* current = text.data() + pos;
-+      const char* end = text.data() + text.size();
-+      const size_t skipped = SkipUnmatchable(current, end);
-+      if (skipped > 0) {
++      const char* current = text_begin + pos;
++      size_t char_size = 0;
++      uint32_t dispatch = DispatchAt(current, text_end, &char_size);
++
++      if (dispatch == 0) {
++        const char* scan = current + char_size;
++        while (scan < text_end) {
++          size_t scan_size = 0;
++          if (DispatchAt(scan, text_end, &scan_size) != 0) {
++            break;
++          }
++          scan += scan_size;
++        }
++        const size_t skipped = static_cast<size_t>(scan - current);
 +        if (changed) {
 +          result->append(current, skipped);
 +        }
@@ -613,24 +772,39 @@ index 00000000..b428e6c2
 +        continue;
 +      }
 +
-+      agent.set_query(current, static_cast<size_t>(end - current));
++      size_t key_id = kInvalidIndex;
++      size_t match_size = 0;
 +
-+      size_t longest_id = kInvalidIndex;
-+      size_t longest_size = 0;
-+      while (trie.common_prefix_search(agent)) {
-+        const size_t key_size = agent.key().length();
-+        if (key_size > longest_size) {
-+          longest_id = agent.key().id();
-+          longest_size = key_size;
++      if ((dispatch & kDispatchPhraseStarter) != 0 && phrase_key_count != 0) {
++        Darts::DoubleArray::result_pair_type match{};
++        if (FindLongestPhrase(current, text_end, &match) &&
++            match.length > char_size) {
++          const size_t candidate_key_id = static_cast<size_t>(match.value - 1);
++          if (candidate_key_id < key_count) {
++            key_id = candidate_key_id;
++            match_size = match.length;
++          }
 +        }
 +      }
 +
-+      if (longest_id != kInvalidIndex) {
++      if (key_id == kInvalidIndex) {
++        const uint32_t encoded_key_id = dispatch & kDispatchKeyMask;
++        if (encoded_key_id != 0) {
++          const size_t candidate_key_id =
++              static_cast<size_t>(encoded_key_id - 1);
++          if (candidate_key_id < key_count) {
++            key_id = candidate_key_id;
++            match_size = char_size;
++          }
++        }
++      }
++
++      if (key_id != kInvalidIndex) {
 +        std::string_view value;
-+        if (GetFirstValue(longest_id, &value)) {
++        if (GetFirstValue(key_id, &value)) {
 +          const bool replacement_changed =
-+              value.size() != longest_size ||
-+              std::memcmp(value.data(), text.data() + pos, longest_size) != 0;
++              value.size() != match_size ||
++              std::memcmp(value.data(), current, match_size) != 0;
 +          if (replacement_changed) {
 +            if (!changed) {
 +              result->reserve(text.size());
@@ -639,21 +813,15 @@ index 00000000..b428e6c2
 +            changed = true;
 +          }
 +          if (changed && !replacement_changed) {
-+            result->append(text.data() + pos, longest_size);
++            result->append(current, match_size);
 +          } else if (changed) {
 +            result->append(value.data(), value.size());
 +          }
-+          pos += longest_size;
++          pos += match_size;
 +          continue;
 +        }
 +      }
 +
-+      current = text.data() + pos;
-+      const size_t char_size =
-+          NextUtf8CharSize(current, text.data() + text.size());
-+      if (char_size == 0) {
-+        return changed;
-+      }
 +      if (changed) {
 +        result->append(current, char_size);
 +      }
@@ -671,59 +839,42 @@ index 00000000..b428e6c2
 +}
 +
 +void WriteStageRecord(std::ostream* out, const StageRecord& record) {
-+  WriteU64(out, record.trie_offset);
-+  WriteU64(out, record.trie_size);
++  WriteU64(out, record.phrase_trie_offset);
++  WriteU64(out, record.phrase_trie_size);
++  WriteU64(out, record.char_directory_offset);
++  WriteU64(out, record.char_pages_offset);
 +  WriteU64(out, record.key_index_offset);
-+  WriteU32(out, record.key_count);
-+  WriteU32(out, record.flags);
 +  WriteU64(out, record.value_pool_offset);
 +  WriteU64(out, record.value_pool_size);
-+  WriteU64(out, record.starter_filter_offset);
-+  WriteU64(out, record.starter_filter_size);
++  WriteU32(out, record.char_page_count);
++  WriteU32(out, record.key_count);
++  WriteU32(out, record.flags);
++  WriteU32(out, record.phrase_key_count);
 +}
 +
 +}  // namespace
 +
 +class RewriteSection::Impl {
 + public:
-+  // One section is one pipeline stage. Stage order belongs to engine/filters.
 +  StageView stage;
 +};
 +
 +RewriteSection::RewriteSection() : impl_(new Impl) {}
 +RewriteSection::~RewriteSection() = default;
 +
-+bool RewriteSection::Lookup(const string& text, vector<string>* values) const {
-+  if (!values) {
-+    return false;
-+  }
-+  values->clear();
-+  if (text.empty()) {
-+    return false;
-+  }
-+  marisa::Agent agent;
-+  return impl_->stage.Lookup(text, &agent, values);
++bool RewriteSection::Lookup(std::string_view text,
++                            vector<string>* values) const {
++  return impl_->stage.Lookup(text, values);
 +}
 +
-+bool RewriteSection::LookupWithPreedit(const string& text,
++bool RewriteSection::LookupWithPreedit(std::string_view text,
 +                                       vector<RewriteResult>* values) const {
-+  if (!values) {
-+    return false;
-+  }
-+  values->clear();
-+  if (text.empty()) {
-+    return false;
-+  }
-+  marisa::Agent agent;
-+  return impl_->stage.LookupWithPreedit(text, &agent, values);
++  return impl_->stage.LookupWithPreedit(text, values);
 +}
 +
-+bool RewriteSection::ConvertSentence(const string& text, string* result) const {
++bool RewriteSection::ConvertSentence(std::string_view text,
++                                     string* result) const {
 +  if (!result) {
-+    return false;
-+  }
-+  result->clear();
-+  if (text.empty()) {
 +    return false;
 +  }
 +  return impl_->stage.ConvertSentence(text, result);
@@ -731,10 +882,7 @@ index 00000000..b428e6c2
 +
 +class RewritePack::Impl {
 + public:
-+  // Destroy stages and mapped name views before releasing the shared mapping.
 +  std::unique_ptr<RewriteMappedFile> file;
-+  // Built only by Open(). Each stage owns one independent mapped trie/view;
-+  // pointees stay at fixed addresses and the index is read-only after loading.
 +  std::unordered_map<std::string_view, std::unique_ptr<RewriteSection>>
 +      sections;
 +};
@@ -790,11 +938,8 @@ index 00000000..b428e6c2
 +  const uint64_t source_checksum = ReadU64(base + 32);
 +  (void)source_checksum;
 +  const uint64_t declared_file_size = ReadU64(base + 40);
-+  if (section_count == 0 || declared_file_size != file_size ||
-+      section_table_offset < kHeaderSize ||
-+      !InRange(section_table_offset,
-+               static_cast<uint64_t>(section_count) * kSectionRecordSize,
-+               file_size)) {
++  if (declared_file_size != file_size ||
++      !ValidateSectionTable(section_count, section_table_offset, file_size)) {
 +    LOG(ERROR) << "rewrite pack '" << file_path_
 +               << "' has a corrupted section directory; redeploy the schema "
 +                  "to rebuild the pack.";
@@ -806,32 +951,16 @@ index 00000000..b428e6c2
 +
 +  for (uint32_t i = 0; i < section_count; ++i) {
 +    const char* p = base + section_table_offset + i * kSectionRecordSize;
-+    SectionRecord section_record;
-+    section_record.name_offset = ReadU64(p);
-+    section_record.name_size = ReadU32(p + 8);
-+    section_record.stage_count = ReadU32(p + 12);
-+    section_record.stage_table_offset = ReadU64(p + 16);
-+
-+    if (!InRange(section_record.name_offset, section_record.name_size,
-+                 file_size) ||
-+        !InRange(section_record.stage_table_offset,
-+                 static_cast<uint64_t>(section_record.stage_count) *
-+                     kStageRecordSize,
-+                 file_size)) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' contains an out-of-range section entry; redeploy the "
-+                    "schema to rebuild the pack.";
-+      return false;
-+    }
-+
-+    const std::string_view name(base + section_record.name_offset,
-+                                section_record.name_size);
-+    if (name.empty() || section_record.stage_count != 1) {
++    const SectionRecord section_record = ReadSectionRecord(p);
++    if (!ValidateSectionRecord(section_record, file_size)) {
 +      LOG(ERROR) << "rewrite pack '" << file_path_
 +                 << "' contains an invalid section entry; redeploy the schema "
 +                    "to rebuild the pack.";
 +      return false;
 +    }
++
++    const std::string_view name(base + section_record.name_offset,
++                                section_record.name_size);
 +    if (impl_->sections.find(name) != impl_->sections.end()) {
 +      LOG(ERROR) << "rewrite pack '" << file_path_
 +                 << "' contains duplicate section '" << name
@@ -841,35 +970,9 @@ index 00000000..b428e6c2
 +
 +    auto section = std::unique_ptr<RewriteSection>(new RewriteSection);
 +    const char* sp = base + section_record.stage_table_offset;
-+    StageRecord stage_record;
-+    stage_record.trie_offset = ReadU64(sp);
-+    stage_record.trie_size = ReadU64(sp + 8);
-+    stage_record.key_index_offset = ReadU64(sp + 16);
-+    stage_record.key_count = ReadU32(sp + 24);
-+    stage_record.flags = ReadU32(sp + 28);
-+    stage_record.value_pool_offset = ReadU64(sp + 32);
-+    stage_record.value_pool_size = ReadU64(sp + 40);
-+    stage_record.starter_filter_offset = ReadU64(sp + 48);
-+    stage_record.starter_filter_size = ReadU64(sp + 56);
-+
-+    const bool has_starter_filter =
-+        (stage_record.flags & kStageFlagHasStarterFilter) != 0;
-+    if (stage_record.key_count == 0 || stage_record.trie_size == 0 ||
-+        stage_record.value_pool_size == 0 ||
-+        (stage_record.flags & ~kKnownStageFlags) != 0 ||
-+        !InRange(stage_record.trie_offset, stage_record.trie_size, file_size) ||
-+        !InRange(
-+            stage_record.key_index_offset,
-+            static_cast<uint64_t>(stage_record.key_count) * kKeyIndexRecordSize,
-+            file_size) ||
-+        !InRange(stage_record.value_pool_offset, stage_record.value_pool_size,
-+                 file_size) ||
-+        (has_starter_filter &&
-+         (stage_record.starter_filter_size != kStarterFilterSize ||
-+          !InRange(stage_record.starter_filter_offset,
-+                   stage_record.starter_filter_size, file_size))) ||
-+        (!has_starter_filter && (stage_record.starter_filter_offset != 0 ||
-+                                 stage_record.starter_filter_size != 0))) {
++    const StageRecord stage_record = ReadStageRecord(sp);
++    const bool has_phrase_trie = stage_record.phrase_key_count != 0;
++    if (!ValidateStageRecord(stage_record, file_size)) {
 +      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
 +                 << "stage metadata in section '" << name
 +                 << "'; redeploy the schema to rebuild the pack.";
@@ -877,47 +980,24 @@ index 00000000..b428e6c2
 +    }
 +
 +    StageView& stage = section->impl_->stage;
++    stage.char_directory = reinterpret_cast<const uint16_t*>(
++        base + stage_record.char_directory_offset);
++    stage.char_pages = reinterpret_cast<const uint32_t*>(
++        base + stage_record.char_pages_offset);
++    stage.char_page_count = stage_record.char_page_count;
 +    stage.key_index = base + stage_record.key_index_offset;
 +    stage.value_pool = base + stage_record.value_pool_offset;
 +    stage.value_pool_end = stage.value_pool + stage_record.value_pool_size;
-+    if (has_starter_filter) {
-+      stage.starter_filter = reinterpret_cast<const uint8_t*>(
-+          base + stage_record.starter_filter_offset);
-+      stage.starter_filter_size =
-+          static_cast<size_t>(stage_record.starter_filter_size);
-+    }
 +    stage.key_count = stage_record.key_count;
++    stage.phrase_key_count = stage_record.phrase_key_count;
 +    stage.flags = stage_record.flags;
 +
-+    try {
-+      stage.trie.map(base + stage_record.trie_offset, stage_record.trie_size);
-+    } catch (const std::exception& ex) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' cannot map trie for section '" << name
-+                 << "': " << ex.what()
-+                 << "; redeploy the schema to rebuild the pack.";
-+      return false;
-+    } catch (...) {
-+      // marisa's public API is not required to use std::exception for every
-+      // malformed-input failure. A damaged pack must fail open cleanly.
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' cannot map trie for section '" << name
-+                 << "' due to an unknown error; redeploy the schema to "
-+                    "rebuild the pack.";
-+      return false;
++    if (has_phrase_trie) {
++      stage.phrase_trie.set_array(
++          base + stage_record.phrase_trie_offset,
++          static_cast<size_t>(stage_record.phrase_trie_size /
++                              stage.phrase_trie.unit_size()));
 +    }
-+
-+    if (stage.trie.num_keys() != stage.key_count) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
-+                 << "stage metadata in section '" << name
-+                 << "'; redeploy the schema to rebuild the pack.";
-+      return false;
-+    }
-+
-+    // Do not scan key/value records here. The pack is memory-mapped so values
-+    // stay demand-paged; GetValueList()/ReadValue() validate the actually hit
-+    // record lazily on the query path. This keeps first open proportional to
-+    // section metadata and trie mapping rather than total dictionary size.
 +
 +    impl_->sections.emplace(name, std::move(section));
 +  }
@@ -928,16 +1008,11 @@ index 00000000..b428e6c2
 +  static std::mutex mutex;
 +  static std::unordered_map<string, std::weak_ptr<RewritePack>> cache;
 +
-+  // Use a stable UTF-8 key for cache identity. The path itself is still passed
-+  // to MappedFile, so native Unicode path handling remains platform-specific.
 +  const string cache_key = file_path.u8string();
 +  uint64_t on_disk_build_id = 0;
 +  const bool has_build_id = ReadPackBuildId(file_path, &on_disk_build_id);
 +
 +  {
-+    // Mapping MARISA tries may still touch pack metadata. Do not hold the
-+    // process-wide cache mutex while doing that work; concurrent misses may
-+    // build duplicate short-lived mappings, but startup is not serialized.
 +    std::lock_guard<std::mutex> lock(mutex);
 +    auto found = cache.find(cache_key);
 +    if (found != cache.end()) {
@@ -1002,11 +1077,6 @@ index 00000000..b428e6c2
 +  }
 +
 +  const uint64_t build_id = ComputeBuildId(sections);
-+  // Always emit a fresh pack. A matching build id only describes the source
-+  // entries; it cannot prove that an existing MARISA body was not truncated
-+  // or modified in place. Re-opening that untrusted body during deployment
-+  // can crash inside marisa::Trie::map before we get a C++ exception. The
-+  // deployment path is cold, while the runtime keeps its mmap/cache fast.
 +
 +  std::error_code ec;
 +  const path parent_path = output_path.parent_path();
@@ -1117,105 +1187,158 @@ index 00000000..b428e6c2
 +      return false;
 +    }
 +
-+    std::array<uint8_t, kStarterFilterSize> starter_filter{};
-+    for (const auto& bucket : buckets) {
-+      const size_t char_size = ValidUtf8CharSize(
-+          bucket.key.data(), bucket.key.data() + bucket.key.size());
-+      if (char_size == 0) {
-+        // A malformed source key may intentionally begin with arbitrary bytes.
-+        // Saturating the filter disables skipping but preserves exact behavior.
-+        starter_filter.fill(0xff);
-+        break;
++    if (buckets.size() > kDispatchKeyMask) {
++      LOG(ERROR) << "cannot build rewrite section '" << source_section.name
++                 << "': key count exceeds the RWP5 direct-dispatch limit.";
++      return false;
++    }
++
++    std::array<uint16_t, kCharDirectoryEntries> char_directory{};
++    vector<std::array<uint32_t, kCharPageSize>> char_pages;
++    vector<size_t> phrase_bucket_ids;
++    phrase_bucket_ids.reserve(buckets.size());
++
++    auto ensure_dispatch_page =
++        [&](uint32_t code_point) -> std::array<uint32_t, kCharPageSize>& {
++      uint16_t& page_id = char_directory[code_point >> kCharPageShift];
++      if (page_id == 0) {
++        char_pages.emplace_back();
++        page_id = static_cast<uint16_t>(char_pages.size());
 +      }
-+      AddStarterFilterEntry(&starter_filter, bucket.key.data(), char_size);
-+    }
-+    stage_record.flags |= kStageFlagHasStarterFilter;
++      return char_pages[page_id - 1];
++    };
 +
-+    // Use MARISA directly. The Keyset receives each unique key once;
-+    // after build(), MARISA writes the generated key id back to Keyset.
-+    // This avoids StringTableBuilder's reference array and its intermediate
-+    // stringstream/vector dump while preserving exactly the same trie model.
-+    marisa::Keyset keyset;
-+    for (const auto& bucket : buckets) {
-+      keyset.push_back(bucket.key.data(), bucket.key.size(), 1.0f);
++    for (size_t key_id = 0; key_id < buckets.size(); ++key_id) {
++      const auto& bucket = buckets[key_id];
++      if (bucket.key.find('\0') != std::string_view::npos) {
++        LOG(ERROR) << "cannot build rewrite section '" << source_section.name
++                   << "': rewrite keys containing NUL bytes are unsupported.";
++        return false;
++      }
++
++      uint32_t first_code_point = 0;
++      size_t first_char_size = 0;
++      if (!ValidateUtf8Key(bucket.key, &first_code_point, &first_char_size)) {
++        LOG(ERROR) << "cannot build rewrite section '" << source_section.name
++                   << "': rewrite key contains invalid UTF-8.";
++        return false;
++      }
++
++      auto& page = ensure_dispatch_page(first_code_point);
++      uint32_t& dispatch = page[first_code_point & kCharPageMask];
++      const uint32_t encoded_key_id = static_cast<uint32_t>(key_id + 1);
++
++      if (first_char_size == bucket.key.size()) {
++        if ((dispatch & kDispatchKeyMask) != 0) {
++          LOG(ERROR) << "internal duplicate single-character key in section '"
++                     << source_section.name << "'.";
++          return false;
++        }
++        dispatch |= encoded_key_id;
++      } else {
++        dispatch |= kDispatchPhraseStarter;
++        phrase_bucket_ids.push_back(key_id);
++      }
 +    }
 +
-+    marisa::Trie trie;
-+    try {
-+      LOG(INFO) << "building rewrite trie '" << source_section.name << "' with "
-+                << buckets.size() << " keys.";
-+      trie.build(keyset);
-+    } catch (const std::exception& ex) {
-+      LOG(ERROR) << "cannot build rewrite trie for section '"
-+                 << source_section.name << "': " << ex.what()
-+                 << "; check source size/content or available memory.";
++    if (char_pages.empty() ||
++        char_pages.size() > std::numeric_limits<uint16_t>::max()) {
++      LOG(ERROR) << "cannot build rewrite section '" << source_section.name
++                 << "': character dispatch table exceeds the RWP5 limit.";
 +      return false;
-+    } catch (...) {
-+      LOG(ERROR) << "cannot build rewrite trie for section '"
-+                 << source_section.name
-+                 << "' due to an unknown error; the pack was not installed.";
-+      return false;
 +    }
 +
-+    if (trie.num_keys() != buckets.size()) {
-+      LOG(ERROR) << "internal rewrite trie key-count mismatch in section '"
-+                 << source_section.name << "'; the pack was not installed.";
-+      return false;
++    const auto byte_less = [&](size_t lhs_id, size_t rhs_id) {
++      const std::string_view lhs = buckets[lhs_id].key;
++      const std::string_view rhs = buckets[rhs_id].key;
++      return std::lexicographical_compare(
++          lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
++          [](char lhs_char, char rhs_char) {
++            return static_cast<unsigned char>(lhs_char) <
++                   static_cast<unsigned char>(rhs_char);
++          });
++    };
++    std::sort(phrase_bucket_ids.begin(), phrase_bucket_ids.end(), byte_less);
++
++    vector<const char*> phrase_keys;
++    vector<size_t> phrase_lengths;
++    vector<int> phrase_values;
++    phrase_keys.reserve(phrase_bucket_ids.size());
++    phrase_lengths.reserve(phrase_bucket_ids.size());
++    phrase_values.reserve(phrase_bucket_ids.size());
++    for (const size_t key_id : phrase_bucket_ids) {
++      phrase_keys.push_back(buckets[key_id].key.data());
++      phrase_lengths.push_back(buckets[key_id].key.size());
++      phrase_values.push_back(static_cast<int>(key_id + 1));
 +    }
 +
-+    vector<size_t> bucket_by_key_id(buckets.size(), kInvalidIndex);
-+    for (size_t i = 0; i < buckets.size(); ++i) {
-+      const size_t key_id = keyset[i].id();
-+      if (key_id >= bucket_by_key_id.size() ||
-+          bucket_by_key_id[key_id] != kInvalidIndex) {
-+        LOG(ERROR) << "internal rewrite trie key-id collision in section '"
++    Darts::DoubleArray phrase_trie;
++    if (!phrase_keys.empty()) {
++      try {
++        LOG(INFO) << "building rewrite phrase trie '" << source_section.name
++                  << "' with " << phrase_keys.size() << " phrase keys and "
++                  << (buckets.size() - phrase_keys.size())
++                  << " direct single-character keys.";
++        phrase_trie.build(phrase_keys.size(), phrase_keys.data(),
++                          phrase_lengths.data(), phrase_values.data());
++      } catch (const std::exception& ex) {
++        LOG(ERROR) << "cannot build rewrite phrase trie for section '"
++                   << source_section.name << "': " << ex.what()
++                   << "; check source size/content or available memory.";
++        return false;
++      } catch (...) {
++        LOG(ERROR) << "cannot build rewrite phrase trie for section '"
++                   << source_section.name
++                   << "' due to an unknown error; the pack was not installed.";
++        return false;
++      }
++      if (phrase_trie.total_size() == 0 ||
++          (phrase_trie.total_size() % phrase_trie.unit_size()) != 0) {
++        LOG(ERROR) << "internal rewrite phrase-trie size mismatch in section '"
 +                   << source_section.name << "'; the pack was not installed.";
 +        return false;
 +      }
-+      bucket_by_key_id[key_id] = i;
 +    }
 +
-+    // The RWP itself owns the single OS mapping. Serialize MARISA directly
-+    // into the pack stream instead of materializing another trie-sized byte
-+    // vector in deployment memory.
-+    Align(&out, alignof(uint64_t));
-+    stage_record.trie_offset = Tell(&out);
-+    stage_record.trie_size = trie.io_size();
-+    try {
-+      marisa::write(out, trie);
-+    } catch (const std::exception& ex) {
-+      LOG(ERROR) << "cannot serialize rewrite trie for section '"
-+                 << source_section.name << "': " << ex.what()
-+                 << "; check available storage and filesystem health.";
-+      return false;
-+    } catch (...) {
-+      LOG(ERROR) << "cannot serialize rewrite trie for section '"
++    Align(&out, alignof(uint32_t));
++    stage_record.char_directory_offset = Tell(&out);
++    out.write(reinterpret_cast<const char*>(char_directory.data()),
++              static_cast<std::streamsize>(sizeof(char_directory)));
++    stage_record.char_pages_offset = Tell(&out);
++    for (const auto& page : char_pages) {
++      out.write(reinterpret_cast<const char*>(page.data()),
++                static_cast<std::streamsize>(sizeof(page)));
++    }
++    stage_record.char_page_count = static_cast<uint32_t>(char_pages.size());
++    if (!out) {
++      LOG(ERROR) << "cannot serialize rewrite dispatch table for section '"
 +                 << source_section.name
-+                 << "' due to an unknown error; the pack was not installed.";
++                 << "'; check available storage and filesystem health.";
 +      return false;
 +    }
-+    if (!out ||
-+        Tell(&out) != stage_record.trie_offset + stage_record.trie_size) {
-+      LOG(ERROR) << "internal rewrite trie serialization size mismatch in "
-+                 << "section '" << source_section.name
-+                 << "'; the pack was not installed.";
-+      return false;
++
++    stage_record.phrase_key_count = static_cast<uint32_t>(phrase_keys.size());
++    if (!phrase_keys.empty()) {
++      Align(&out, alignof(uint32_t));
++      stage_record.phrase_trie_offset = Tell(&out);
++      stage_record.phrase_trie_size = phrase_trie.total_size();
++      out.write(reinterpret_cast<const char*>(phrase_trie.array()),
++                static_cast<std::streamsize>(phrase_trie.total_size()));
++      if (!out || Tell(&out) != stage_record.phrase_trie_offset +
++                                    stage_record.phrase_trie_size) {
++        LOG(ERROR) << "cannot serialize rewrite phrase trie for section '"
++                   << source_section.name
++                   << "'; check available storage and filesystem health.";
++        return false;
++      }
 +    }
 +
 +    stage_record.key_index_offset = Tell(&out);
 +    stage_record.key_count = static_cast<uint32_t>(buckets.size());
 +
 +    uint64_t value_pool_size = 0;
-+    for (size_t key_id = 0; key_id < bucket_by_key_id.size(); ++key_id) {
-+      const size_t bucket_index = bucket_by_key_id[key_id];
-+      if (bucket_index == kInvalidIndex) {
-+        LOG(ERROR) << "internal rewrite trie contains an unmapped key id in "
-+                   << "section '" << source_section.name
-+                   << "'; the pack was not installed.";
-+        return false;
-+      }
-+
-+      const auto& values = buckets[bucket_index].values;
++    for (const auto& bucket : buckets) {
++      const auto& values = bucket.values;
 +      if (values.empty() || !FitsU32(values.size()) ||
 +          value_pool_size > std::numeric_limits<uint32_t>::max()) {
 +        LOG(ERROR) << "rewrite value list in section '" << source_section.name
@@ -1256,9 +1379,8 @@ index 00000000..b428e6c2
 +
 +    stage_record.value_pool_offset = Tell(&out);
 +    stage_record.value_pool_size = value_pool_size;
-+    for (size_t key_id = 0; key_id < bucket_by_key_id.size(); ++key_id) {
-+      const auto& values = buckets[bucket_by_key_id[key_id]].values;
-+      for (const auto& item : values) {
++    for (const auto& bucket : buckets) {
++      for (const auto& item : bucket.values) {
 +        if (has_preedit) {
 +          WriteVarUint32(&out, static_cast<uint32_t>(item.preedit.size()));
 +          out.write(item.preedit.data(), item.preedit.size());
@@ -1270,17 +1392,6 @@ index 00000000..b428e6c2
 +    if (!out || Tell(&out) != stage_record.value_pool_offset +
 +                                  stage_record.value_pool_size) {
 +      LOG(ERROR) << "internal rewrite value-pool size mismatch in section '"
-+                 << source_section.name << "'; the pack was not installed.";
-+      return false;
-+    }
-+
-+    stage_record.starter_filter_offset = Tell(&out);
-+    stage_record.starter_filter_size = starter_filter.size();
-+    out.write(reinterpret_cast<const char*>(starter_filter.data()),
-+              starter_filter.size());
-+    if (!out || Tell(&out) != stage_record.starter_filter_offset +
-+                                  stage_record.starter_filter_size) {
-+      LOG(ERROR) << "internal rewrite starter-filter size mismatch in section '"
 +                 << source_section.name << "'; the pack was not installed.";
 +      return false;
 +    }
@@ -1374,10 +1485,7 @@ index 00000000..b428e6c2
 +
 +  const uint32_t section_count = ReadU32(header.data() + 12);
 +  const uint64_t section_table_offset = ReadU64(header.data() + 16);
-+  if (section_count == 0 || section_table_offset < kHeaderSize ||
-+      !InRange(section_table_offset,
-+               static_cast<uint64_t>(section_count) * kSectionRecordSize,
-+               actual_size)) {
++  if (!ValidateSectionTable(section_count, section_table_offset, actual_size)) {
 +    return false;
 +  }
 +
@@ -1392,49 +1500,28 @@ index 00000000..b428e6c2
 +      return false;
 +    }
 +
-+    const uint64_t name_offset = ReadU64(section_bytes.data());
-+    const uint32_t name_size = ReadU32(section_bytes.data() + 8);
-+    const uint32_t stage_count = ReadU32(section_bytes.data() + 12);
-+    const uint64_t stage_table_offset = ReadU64(section_bytes.data() + 16);
-+    if (name_size == 0 || stage_count != 1 ||
-+        !InRange(name_offset, name_size, actual_size) ||
-+        !InRange(stage_table_offset, kStageRecordSize, actual_size)) {
++    const SectionRecord section_record =
++        ReadSectionRecord(section_bytes.data());
++    if (!ValidateSectionRecord(section_record, actual_size)) {
 +      return false;
 +    }
 +
-+    string name(name_size, '\0');
-+    in.seekg(static_cast<std::streamoff>(name_offset));
++    string name(section_record.name_size, '\0');
++    in.seekg(static_cast<std::streamoff>(section_record.name_offset));
 +    in.read(name.data(), static_cast<std::streamsize>(name.size()));
 +    if (!in || !section_names.insert(name).second) {
 +      return false;
 +    }
 +
 +    std::array<char, kStageRecordSize> stage_bytes{};
-+    in.seekg(static_cast<std::streamoff>(stage_table_offset));
++    in.seekg(static_cast<std::streamoff>(section_record.stage_table_offset));
 +    in.read(stage_bytes.data(), stage_bytes.size());
 +    if (!in) {
 +      return false;
 +    }
 +
-+    const uint64_t trie_offset = ReadU64(stage_bytes.data());
-+    const uint64_t trie_size = ReadU64(stage_bytes.data() + 8);
-+    const uint64_t key_index_offset = ReadU64(stage_bytes.data() + 16);
-+    const uint32_t key_count = ReadU32(stage_bytes.data() + 24);
-+    const uint32_t flags = ReadU32(stage_bytes.data() + 28);
-+    const uint64_t value_pool_offset = ReadU64(stage_bytes.data() + 32);
-+    const uint64_t value_pool_size = ReadU64(stage_bytes.data() + 40);
-+    const uint64_t starter_filter_offset = ReadU64(stage_bytes.data() + 48);
-+    const uint64_t starter_filter_size = ReadU64(stage_bytes.data() + 56);
-+    if (key_count == 0 || trie_size == 0 || value_pool_size == 0 ||
-+        (flags & ~kKnownStageFlags) != 0 ||
-+        (flags & kStageFlagHasStarterFilter) == 0 ||
-+        !InRange(trie_offset, trie_size, actual_size) ||
-+        !InRange(key_index_offset,
-+                 static_cast<uint64_t>(key_count) * kKeyIndexRecordSize,
-+                 actual_size) ||
-+        !InRange(value_pool_offset, value_pool_size, actual_size) ||
-+        starter_filter_size != kStarterFilterSize ||
-+        !InRange(starter_filter_offset, starter_filter_size, actual_size)) {
++    const StageRecord stage_record = ReadStageRecord(stage_bytes.data());
++    if (!ValidateStageRecord(stage_record, actual_size)) {
 +      return false;
 +    }
 +  }
@@ -1456,10 +1543,10 @@ index 00000000..b428e6c2
 +}  // namespace rime
 diff --git a/src/rime/dict/rewrite_pack.h b/src/rime/dict/rewrite_pack.h
 new file mode 100644
-index 00000000..8b5986f9
+index 0000000..868e409
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,101 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -1470,6 +1557,7 @@ index 00000000..8b5986f9
 +#include <cstdint>
 +#include <memory>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +#include <rime_api.h>
@@ -1532,11 +1620,11 @@ index 00000000..8b5986f9
 + public:
 +  ~RewriteSection();
 +
-+  // Read only this stage's mapped trie and values, with a query-local Agent.
-+  bool Lookup(const string& text, vector<string>* values) const;
-+  bool LookupWithPreedit(const string& text,
++  // Read this stage's mapped dispatch table, phrase trie and values.
++  bool Lookup(std::string_view text, vector<string>* values) const;
++  bool LookupWithPreedit(std::string_view text,
 +                         vector<RewriteResult>* values) const;
-+  bool ConvertSentence(const string& text, string* result) const;
++  bool ConvertSentence(std::string_view text, string* result) const;
 +
 + private:
 +  friend class RewritePack;
@@ -1561,7 +1649,7 @@ index 00000000..8b5986f9
 +
 +#endif  // RIME_REWRITE_PACK_H_
 diff --git a/src/rime/gear/gears_module.cc b/src/rime/gear/gears_module.cc
-index 4aa5d1db..ab77c587 100644
+index 4aa5d1d..ab77c58 100644
 --- a/src/rime/gear/gears_module.cc
 +++ b/src/rime/gear/gears_module.cc
 @@ -23,6 +23,7 @@
@@ -1582,10 +1670,10 @@ index 4aa5d1db..ab77c587 100644
    if (!r.Find("charset_filter")) {  // allow improved implementation
 diff --git a/src/rime/gear/rewriter.cc b/src/rime/gear/rewriter.cc
 new file mode 100644
-index 00000000..85d2fea1
+index 0000000..b5879b1
 --- /dev/null
 +++ b/src/rime/gear/rewriter.cc
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,475 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -1594,7 +1682,6 @@ index 00000000..85d2fea1
 +
 +#include <algorithm>
 +#include <deque>
-+#include <unordered_set>
 +
 +#include <rime/candidate.h>
 +#include <rime/composition.h>
@@ -1718,19 +1805,19 @@ index 00000000..85d2fea1
 +      return;
 +    }
 +
-+    const string input = context_->input().substr(start, end - start);
++    const string& context_input = context_->input();
++    const std::string_view input(context_input.data() + start, end - start);
 +    vector<RewriteResult> values;
 +    if (!rewriter_->stage_->LookupWithPreedit(input, &values)) {
 +      return;
 +    }
-+    std::unordered_set<string> seen;
++    const string type = rewriter_->options_.cand_type.empty()
++                            ? "abbrev"
++                            : rewriter_->options_.cand_type;
 +    for (const auto& value : values) {
-+      if (value.value.empty() || !seen.insert(value.value).second) {
++      if (value.value.empty()) {
 +        continue;
 +      }
-+      const string type = rewriter_->options_.cand_type.empty()
-+                              ? "abbrev"
-+                              : rewriter_->options_.cand_type;
 +      auto candidate = New<SimpleCandidate>(type, start, end, value.value,
 +                                            string(), value.preedit);
 +      injected_.push_back(candidate);
@@ -1947,7 +2034,7 @@ index 00000000..85d2fea1
 +  return false;
 +}
 +
-+bool Rewriter::Rewrite(const string& text, vector<string>* values) const {
++bool Rewriter::Rewrite(std::string_view text, vector<string>* values) const {
 +  values->clear();
 +  if (!stage_) {
 +    return false;
@@ -1963,7 +2050,7 @@ index 00000000..85d2fea1
 +  return stage_->Lookup(text, values);
 +}
 +
-+string Rewriter::CandidateType(const an<Candidate>& candidate) const {
++const string& Rewriter::CandidateType(const an<Candidate>& candidate) const {
 +  return options_.cand_type.empty() ? candidate->type() : options_.cand_type;
 +}
 +
@@ -2031,7 +2118,7 @@ index 00000000..85d2fea1
 +    result->push_back(candidate);
 +  }
 +
-+  const string type = CandidateType(candidate);
++  const string& type = CandidateType(candidate);
 +  for (const auto& value : values) {
 +    // The compiler deduplicates values for each key. The only duplicate that
 +    // matters here is an append result equal to the original candidate.
@@ -2064,10 +2151,10 @@ index 00000000..85d2fea1
 +}  // namespace rime
 diff --git a/src/rime/gear/rewriter.h b/src/rime/gear/rewriter.h
 new file mode 100644
-index 00000000..25e58ef4
+index 0000000..7b465dc
 --- /dev/null
 +++ b/src/rime/gear/rewriter.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,79 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2078,6 +2165,7 @@ index 00000000..25e58ef4
 +#include <memory>
 +#include <set>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +#include <rime/filter.h>
@@ -2124,9 +2212,9 @@ index 00000000..25e58ef4
 +
 +  void LoadConfig();
 +  bool Active() const;
-+  bool Rewrite(const string& text, vector<string>* values) const;
++  bool Rewrite(std::string_view text, vector<string>* values) const;
 +  bool Transform(const an<Candidate>& candidate, CandidateQueue* result) const;
-+  string CandidateType(const an<Candidate>& candidate) const;
++  const string& CandidateType(const an<Candidate>& candidate) const;
 +  string DerivedComment(const an<Candidate>& candidate) const;
 +  string FormatComment(const string& value) const;
 +
@@ -2147,10 +2235,10 @@ index 00000000..25e58ef4
 +
 +#endif  // RIME_REWRITER_H_
 diff --git a/src/rime/lever/deployment_tasks.cc b/src/rime/lever/deployment_tasks.cc
-index 6e6ff895..a5668047 100644
+index a51fe9f..89f49ec 100644
 --- a/src/rime/lever/deployment_tasks.cc
 +++ b/src/rime/lever/deployment_tasks.cc
-@@ -24,6 +24,7 @@
+@@ -26,6 +26,7 @@
  #include <rime/dict/dictionary.h>
  #include <rime/dict/dict_compiler.h>
  #include <rime/lever/deployment_tasks.h>
@@ -2158,7 +2246,7 @@ index 6e6ff895..a5668047 100644
  #include <rime/lever/user_dict_manager.h>
  #ifdef _WIN32
  #include <windows.h>
-@@ -346,6 +347,18 @@ bool SchemaUpdate::Run(Deployer* deployer) {
+@@ -564,6 +565,18 @@ bool SchemaUpdate::Run(Deployer* deployer) {
    }
    // reload compiled config
    config.reset(Config::Require("schema")->Create(schema_id));
@@ -2179,10 +2267,10 @@ index 6e6ff895..a5668047 100644
      // not requiring a dictionary
 diff --git a/src/rime/lever/rewrite_compiler.cc b/src/rime/lever/rewrite_compiler.cc
 new file mode 100644
-index 00000000..2828e7f2
+index 0000000..b33ff13
 --- /dev/null
 +++ b/src/rime/lever/rewrite_compiler.cc
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,578 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2197,6 +2285,7 @@ index 00000000..2828e7f2
 +#include <cstdint>
 +#include <filesystem>
 +#include <fstream>
++#include <string_view>
 +#include <system_error>
 +#include <unordered_set>
 +#include <utility>
@@ -2260,7 +2349,7 @@ index 00000000..2828e7f2
 +  return first != string::npos && (*line)[first] != '#';
 +}
 +
-+string DecodeEscapes(const string& text) {
++string DecodeEscapes(std::string_view text) {
 +  string result;
 +  result.reserve(text.size());
 +  for (size_t i = 0; i < text.size(); ++i) {
@@ -2292,24 +2381,19 @@ index 00000000..2828e7f2
 +  return result;
 +}
 +
-+bool ParseFileLine(const string& source, string* key, vector<string>* values) {
-+  if (!key || !values) {
++bool ParseFileLine(std::string_view source, string* key, string* value) {
++  if (!key || !value) {
 +    return false;
 +  }
 +
 +  const size_t tab = source.find('\t');
-+  if (tab == string::npos || tab == 0 || tab + 1 >= source.size()) {
++  if (tab == std::string_view::npos || tab == 0 || tab + 1 >= source.size()) {
 +    return false;
 +  }
 +
 +  *key = DecodeEscapes(source.substr(0, tab));
-+  const string value = DecodeEscapes(source.substr(tab + 1));
-+  values->clear();
-+  if (key->empty() || value.empty()) {
-+    return false;
-+  }
-+  values->push_back(value);
-+  return true;
++  *value = DecodeEscapes(source.substr(tab + 1));
++  return !key->empty() && !value->empty();
 +}
 +
 +bool IsWithin(const path& root, const path& candidate) {
@@ -2554,8 +2638,8 @@ index 00000000..2828e7f2
 +    }
 +
 +    string key;
-+    vector<string> values;
-+    if (!ParseFileLine(line, &key, &values)) {
++    string value;
++    if (!ParseFileLine(line, &key, &value)) {
 +      LOG(ERROR) << "rewriter@" << section_name << " source " << file_path
 +                 << ':' << line_number
 +                 << " is malformed; expected non-empty key<TAB>value.";
@@ -2579,9 +2663,8 @@ index 00000000..2828e7f2
 +      }
 +    }
 +
-+    for (const auto& value : values) {
-+      stage->entries.push_back({key, value, preedit});
-+    }
++    stage->entries.push_back(
++        {std::move(key), std::move(value), std::move(preedit)});
 +  }
 +
 +  if (in.bad()) {
@@ -2664,12 +2747,12 @@ index 00000000..2828e7f2
 +
 +  // One rewriter section is one pipeline stage. All files listed here are
 +  // merged into this single stage/trie in the declared order.
-+  std::unordered_set<string> seen_files;
++  std::unordered_set<std::filesystem::path> seen_files;
 +  seen_files.reserve(source.files.size());
 +  for (const auto& file : source.files) {
 +    const string& file_name = file.declared_name;
 +    const path& file_path = file.resolved_path;
-+    const string identity = file_path.generic_string();
++    const auto& identity = static_cast<const std::filesystem::path&>(file_path);
 +    if (!seen_files.insert(identity).second) {
 +      LOG(WARNING) << "rewriter@" << source.name << " lists source '"
 +                   << file_name
@@ -2768,7 +2851,7 @@ index 00000000..2828e7f2
 +}  // namespace rime
 diff --git a/src/rime/lever/rewrite_compiler.h b/src/rime/lever/rewrite_compiler.h
 new file mode 100644
-index 00000000..6e4ff177
+index 0000000..6e4ff17
 --- /dev/null
 +++ b/src/rime/lever/rewrite_compiler.h
 @@ -0,0 +1,32 @@
