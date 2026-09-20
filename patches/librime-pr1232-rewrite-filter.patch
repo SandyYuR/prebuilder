@@ -1,9 +1,9 @@
 diff --git a/src/rime/dict/rewrite_pack.cc b/src/rime/dict/rewrite_pack.cc
 new file mode 100644
-index 00000000..e8d6b942
+index 00000000..b428e6c2
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.cc
-@@ -0,0 +1,1288 @@
+@@ -0,0 +1,1450 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -56,8 +56,16 @@ index 00000000..e8d6b942
 +constexpr uint32_t kStageRecordSize = 64;
 +constexpr uint32_t kKeyIndexRecordSize = 8;
 +constexpr uint32_t kStageFlagHasPreedit = 1U << 0;
-+constexpr uint32_t kKnownStageFlags = kStageFlagHasPreedit;
++constexpr uint32_t kStageFlagHasStarterFilter = 1U << 1;
++constexpr uint32_t kKnownStageFlags =
++    kStageFlagHasPreedit | kStageFlagHasStarterFilter;
++constexpr size_t kStarterFilterBitCount = 1U << 16;
++constexpr size_t kStarterFilterSize = kStarterFilterBitCount / 8;
++constexpr uint64_t kBuildIdRevision = 2;
 +constexpr size_t kInvalidIndex = std::numeric_limits<size_t>::max();
++
++static_assert((kStarterFilterBitCount & (kStarterFilterBitCount - 1)) == 0,
++              "starter filter size must be a power of two");
 +
 +struct SectionRecord {
 +  uint64_t name_offset = 0;
@@ -74,6 +82,8 @@ index 00000000..e8d6b942
 +  uint32_t flags = 0;
 +  uint64_t value_pool_offset = 0;
 +  uint64_t value_pool_size = 0;
++  uint64_t starter_filter_offset = 0;
++  uint64_t starter_filter_size = 0;
 +};
 +
 +inline uint32_t ReadU32(const char* p) {
@@ -153,6 +163,48 @@ index 00000000..e8d6b942
 +    return 1;
 +  }
 +  return static_cast<size_t>(next - begin);
++}
++
++size_t ValidUtf8CharSize(const char* begin, const char* end) {
++  if (!begin || !end || begin >= end) {
++    return 0;
++  }
++
++  const auto* p = reinterpret_cast<const unsigned char*>(begin);
++  const size_t remaining = static_cast<size_t>(end - begin);
++  const unsigned char first = p[0];
++
++  if (first <= 0x7f) {
++    return 1;
++  }
++  if (first >= 0xc2 && first <= 0xdf) {
++    return remaining >= 2 && (p[1] & 0xc0) == 0x80 ? 2 : 0;
++  }
++  if (first >= 0xe0 && first <= 0xef) {
++    if (remaining < 3 || (p[2] & 0xc0) != 0x80) {
++      return 0;
++    }
++    if (first == 0xe0) {
++      return p[1] >= 0xa0 && p[1] <= 0xbf ? 3 : 0;
++    }
++    if (first == 0xed) {
++      return p[1] >= 0x80 && p[1] <= 0x9f ? 3 : 0;
++    }
++    return (p[1] & 0xc0) == 0x80 ? 3 : 0;
++  }
++  if (first >= 0xf0 && first <= 0xf4) {
++    if (remaining < 4 || (p[2] & 0xc0) != 0x80 || (p[3] & 0xc0) != 0x80) {
++      return 0;
++    }
++    if (first == 0xf0) {
++      return p[1] >= 0x90 && p[1] <= 0xbf ? 4 : 0;
++    }
++    if (first == 0xf4) {
++      return p[1] >= 0x80 && p[1] <= 0x8f ? 4 : 0;
++    }
++    return (p[1] & 0xc0) == 0x80 ? 4 : 0;
++  }
++  return 0;
 +}
 +
 +std::atomic<uint64_t> g_temp_counter{0};
@@ -273,6 +325,23 @@ index 00000000..e8d6b942
 +  return hash;
 +}
 +
++size_t StarterFilterBit(const char* data, size_t size, uint64_t seed) {
++  const uint64_t hash = HashBytes(seed, data, size);
++  return static_cast<size_t>(hash & (kStarterFilterBitCount - 1));
++}
++
++void AddStarterFilterEntry(
++    std::array<uint8_t, kStarterFilterSize>* starter_filter,
++    const char* data,
++    size_t size) {
++  constexpr uint64_t kSeeds[] = {1469598103934665603ULL,
++                                 7809847782465536322ULL};
++  for (const uint64_t seed : kSeeds) {
++    const size_t bit = StarterFilterBit(data, size, seed);
++    (*starter_filter)[bit >> 3] |= static_cast<uint8_t>(1U << (bit & 7));
++  }
++}
++
 +uint64_t HashU64(uint64_t hash, uint64_t value) {
 +  std::array<char, 8> bytes{};
 +  for (size_t i = 0; i < bytes.size(); ++i) {
@@ -289,6 +358,7 @@ index 00000000..e8d6b942
 +uint64_t ComputeBuildId(const vector<RewriteSectionData>& sections) {
 +  uint64_t hash = 1469598103934665603ULL;
 +  hash = HashU64(hash, kFormatVersion);
++  hash = HashU64(hash, kBuildIdRevision);
 +  hash = HashU64(hash, sections.size());
 +  for (const auto& section : sections) {
 +    hash = HashString(hash, section.name);
@@ -350,8 +420,42 @@ index 00000000..e8d6b942
 +  const char* key_index = nullptr;
 +  const char* value_pool = nullptr;
 +  const char* value_pool_end = nullptr;
++  const uint8_t* starter_filter = nullptr;
++  size_t starter_filter_size = 0;
 +  uint32_t key_count = 0;
 +  uint32_t flags = 0;
++
++  bool MayStartKey(const char* data, size_t size) const {
++    if (!starter_filter || starter_filter_size != kStarterFilterSize) {
++      return true;
++    }
++    constexpr uint64_t kSeeds[] = {1469598103934665603ULL,
++                                   7809847782465536322ULL};
++    for (const uint64_t seed : kSeeds) {
++      const size_t bit = StarterFilterBit(data, size, seed);
++      if ((starter_filter[bit >> 3] & static_cast<uint8_t>(1U << (bit & 7))) ==
++          0) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  size_t SkipUnmatchable(const char* begin, const char* end) const {
++    if (!starter_filter || !begin || !end || begin >= end) {
++      return 0;
++    }
++
++    const char* current = begin;
++    while (current < end) {
++      const size_t char_size = ValidUtf8CharSize(current, end);
++      if (char_size == 0 || MayStartKey(current, char_size)) {
++        break;
++      }
++      current += char_size;
++    }
++    return static_cast<size_t>(current - begin);
++  }
 +
 +  static bool ReadValue(const char** cursor,
 +                        const char* end,
@@ -498,7 +602,18 @@ index 00000000..e8d6b942
 +    marisa::Agent agent;
 +
 +    while (pos < text.size()) {
-+      agent.set_query(text.data() + pos, text.size() - pos);
++      const char* current = text.data() + pos;
++      const char* end = text.data() + text.size();
++      const size_t skipped = SkipUnmatchable(current, end);
++      if (skipped > 0) {
++        if (changed) {
++          result->append(current, skipped);
++        }
++        pos += skipped;
++        continue;
++      }
++
++      agent.set_query(current, static_cast<size_t>(end - current));
 +
 +      size_t longest_id = kInvalidIndex;
 +      size_t longest_size = 0;
@@ -533,7 +648,7 @@ index 00000000..e8d6b942
 +        }
 +      }
 +
-+      const char* current = text.data() + pos;
++      current = text.data() + pos;
 +      const size_t char_size =
 +          NextUtf8CharSize(current, text.data() + text.size());
 +      if (char_size == 0) {
@@ -563,8 +678,8 @@ index 00000000..e8d6b942
 +  WriteU32(out, record.flags);
 +  WriteU64(out, record.value_pool_offset);
 +  WriteU64(out, record.value_pool_size);
-+  WriteU64(out, 0);
-+  WriteU64(out, 0);
++  WriteU64(out, record.starter_filter_offset);
++  WriteU64(out, record.starter_filter_size);
 +}
 +
 +}  // namespace
@@ -734,7 +849,11 @@ index 00000000..e8d6b942
 +    stage_record.flags = ReadU32(sp + 28);
 +    stage_record.value_pool_offset = ReadU64(sp + 32);
 +    stage_record.value_pool_size = ReadU64(sp + 40);
++    stage_record.starter_filter_offset = ReadU64(sp + 48);
++    stage_record.starter_filter_size = ReadU64(sp + 56);
 +
++    const bool has_starter_filter =
++        (stage_record.flags & kStageFlagHasStarterFilter) != 0;
 +    if (stage_record.key_count == 0 || stage_record.trie_size == 0 ||
 +        stage_record.value_pool_size == 0 ||
 +        (stage_record.flags & ~kKnownStageFlags) != 0 ||
@@ -744,7 +863,13 @@ index 00000000..e8d6b942
 +            static_cast<uint64_t>(stage_record.key_count) * kKeyIndexRecordSize,
 +            file_size) ||
 +        !InRange(stage_record.value_pool_offset, stage_record.value_pool_size,
-+                 file_size)) {
++                 file_size) ||
++        (has_starter_filter &&
++         (stage_record.starter_filter_size != kStarterFilterSize ||
++          !InRange(stage_record.starter_filter_offset,
++                   stage_record.starter_filter_size, file_size))) ||
++        (!has_starter_filter && (stage_record.starter_filter_offset != 0 ||
++                                 stage_record.starter_filter_size != 0))) {
 +      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
 +                 << "stage metadata in section '" << name
 +                 << "'; redeploy the schema to rebuild the pack.";
@@ -755,6 +880,12 @@ index 00000000..e8d6b942
 +    stage.key_index = base + stage_record.key_index_offset;
 +    stage.value_pool = base + stage_record.value_pool_offset;
 +    stage.value_pool_end = stage.value_pool + stage_record.value_pool_size;
++    if (has_starter_filter) {
++      stage.starter_filter = reinterpret_cast<const uint8_t*>(
++          base + stage_record.starter_filter_offset);
++      stage.starter_filter_size =
++          static_cast<size_t>(stage_record.starter_filter_size);
++    }
 +    stage.key_count = stage_record.key_count;
 +    stage.flags = stage_record.flags;
 +
@@ -986,6 +1117,20 @@ index 00000000..e8d6b942
 +      return false;
 +    }
 +
++    std::array<uint8_t, kStarterFilterSize> starter_filter{};
++    for (const auto& bucket : buckets) {
++      const size_t char_size = ValidUtf8CharSize(
++          bucket.key.data(), bucket.key.data() + bucket.key.size());
++      if (char_size == 0) {
++        // A malformed source key may intentionally begin with arbitrary bytes.
++        // Saturating the filter disables skipping but preserves exact behavior.
++        starter_filter.fill(0xff);
++        break;
++      }
++      AddStarterFilterEntry(&starter_filter, bucket.key.data(), char_size);
++    }
++    stage_record.flags |= kStageFlagHasStarterFilter;
++
 +    // Use MARISA directly. The Keyset receives each unique key once;
 +    // after build(), MARISA writes the generated key id back to Keyset.
 +    // This avoids StringTableBuilder's reference array and its intermediate
@@ -1128,6 +1273,18 @@ index 00000000..e8d6b942
 +                 << source_section.name << "'; the pack was not installed.";
 +      return false;
 +    }
++
++    stage_record.starter_filter_offset = Tell(&out);
++    stage_record.starter_filter_size = starter_filter.size();
++    out.write(reinterpret_cast<const char*>(starter_filter.data()),
++              starter_filter.size());
++    if (!out || Tell(&out) != stage_record.starter_filter_offset +
++                                  stage_record.starter_filter_size) {
++      LOG(ERROR) << "internal rewrite starter-filter size mismatch in section '"
++                 << source_section.name << "'; the pack was not installed.";
++      return false;
++    }
++
 +    const uint64_t return_pos = Tell(&out);
 +    out.seekp(section_record.stage_table_offset);
 +    if (!out) {
@@ -1266,13 +1423,18 @@ index 00000000..e8d6b942
 +    const uint32_t flags = ReadU32(stage_bytes.data() + 28);
 +    const uint64_t value_pool_offset = ReadU64(stage_bytes.data() + 32);
 +    const uint64_t value_pool_size = ReadU64(stage_bytes.data() + 40);
++    const uint64_t starter_filter_offset = ReadU64(stage_bytes.data() + 48);
++    const uint64_t starter_filter_size = ReadU64(stage_bytes.data() + 56);
 +    if (key_count == 0 || trie_size == 0 || value_pool_size == 0 ||
 +        (flags & ~kKnownStageFlags) != 0 ||
++        (flags & kStageFlagHasStarterFilter) == 0 ||
 +        !InRange(trie_offset, trie_size, actual_size) ||
 +        !InRange(key_index_offset,
 +                 static_cast<uint64_t>(key_count) * kKeyIndexRecordSize,
 +                 actual_size) ||
-+        !InRange(value_pool_offset, value_pool_size, actual_size)) {
++        !InRange(value_pool_offset, value_pool_size, actual_size) ||
++        starter_filter_size != kStarterFilterSize ||
++        !InRange(starter_filter_offset, starter_filter_size, actual_size)) {
 +      return false;
 +    }
 +  }
