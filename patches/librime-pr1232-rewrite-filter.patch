@@ -1,0 +1,2644 @@
+diff --git a/src/rime/dict/rewrite_pack.cc b/src/rime/dict/rewrite_pack.cc
+new file mode 100644
+index 00000000..e8d6b942
+--- /dev/null
++++ b/src/rime/dict/rewrite_pack.cc
+@@ -0,0 +1,1288 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#include <rime/dict/rewrite_pack.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <exception>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <mutex>
++#include <string_view>
++#include <system_error>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++
++#include <marisa.h>
++#include <utf8.h>
++
++#include <rime/dict/mapped_file.h>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#ifdef min
++#undef min
++#endif
++#ifdef max
++#undef max
++#endif
++#endif
++
++namespace rime {
++namespace {
++
++constexpr char kMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'P', '4'};
++constexpr uint32_t kFormatVersion = 4;
++constexpr uint32_t kHeaderSize = 48;
++constexpr uint32_t kSectionRecordSize = 24;
++constexpr uint32_t kStageRecordSize = 64;
++constexpr uint32_t kKeyIndexRecordSize = 8;
++constexpr uint32_t kStageFlagHasPreedit = 1U << 0;
++constexpr uint32_t kKnownStageFlags = kStageFlagHasPreedit;
++constexpr size_t kInvalidIndex = std::numeric_limits<size_t>::max();
++
++struct SectionRecord {
++  uint64_t name_offset = 0;
++  uint32_t name_size = 0;
++  uint32_t stage_count = 0;
++  uint64_t stage_table_offset = 0;
++};
++
++struct StageRecord {
++  uint64_t trie_offset = 0;
++  uint64_t trie_size = 0;
++  uint64_t key_index_offset = 0;
++  uint32_t key_count = 0;
++  uint32_t flags = 0;
++  uint64_t value_pool_offset = 0;
++  uint64_t value_pool_size = 0;
++};
++
++inline uint32_t ReadU32(const char* p) {
++  const auto* b = reinterpret_cast<const unsigned char*>(p);
++  return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
++         (static_cast<uint32_t>(b[2]) << 16) |
++         (static_cast<uint32_t>(b[3]) << 24);
++}
++
++inline uint64_t ReadU64(const char* p) {
++  uint64_t value = 0;
++  for (int i = 7; i >= 0; --i) {
++    value =
++        (value << 8) | static_cast<uint64_t>(static_cast<unsigned char>(p[i]));
++  }
++  return value;
++}
++
++void WriteU32(std::ostream* out, uint32_t value) {
++  std::array<char, 4> bytes{};
++  for (size_t i = 0; i < bytes.size(); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  out->write(bytes.data(), bytes.size());
++}
++
++void WriteU64(std::ostream* out, uint64_t value) {
++  std::array<char, 8> bytes{};
++  for (size_t i = 0; i < bytes.size(); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  out->write(bytes.data(), bytes.size());
++}
++
++void WriteZeros(std::ostream* out, size_t count) {
++  static constexpr std::array<char, 64> kZeros{};
++  while (count > 0) {
++    const size_t chunk = std::min(count, kZeros.size());
++    out->write(kZeros.data(), chunk);
++    count -= chunk;
++  }
++}
++
++uint64_t Tell(std::ostream* out) {
++  const std::streampos position = out->tellp();
++  return position < 0 ? 0 : static_cast<uint64_t>(position);
++}
++
++void Align(std::ostream* out, size_t alignment) {
++  const uint64_t position = Tell(out);
++  const size_t padding =
++      static_cast<size_t>((alignment - position % alignment) % alignment);
++  WriteZeros(out, padding);
++}
++
++bool InRange(uint64_t offset, uint64_t size, uint64_t file_size) {
++  return offset <= file_size && size <= file_size - offset;
++}
++
++bool FitsU32(size_t value) {
++  return value <= std::numeric_limits<uint32_t>::max();
++}
++
++size_t NextUtf8CharSize(const char* begin, const char* end) {
++  if (!begin || !end || begin >= end) {
++    return 0;
++  }
++  const char* next = begin;
++  try {
++    utf8::next(next, end);
++  } catch (const std::exception&) {
++    // Preserve malformed input byte-for-byte rather than reading past the
++    // candidate buffer. Normal Rime text takes the fast, non-throwing path.
++    return 1;
++  }
++  if (next <= begin || next > end) {
++    return 1;
++  }
++  return static_cast<size_t>(next - begin);
++}
++
++std::atomic<uint64_t> g_temp_counter{0};
++
++path MakeTemporaryPath(const path& output_path) {
++  const uint64_t now = static_cast<uint64_t>(
++      std::chrono::steady_clock::now().time_since_epoch().count());
++  const uint64_t thread = static_cast<uint64_t>(
++      std::hash<std::thread::id>{}(std::this_thread::get_id()));
++  const uint64_t sequence = g_temp_counter.fetch_add(1);
++
++  path temporary_path = output_path;
++  const string suffix = ".tmp." + std::to_string(now) + "." +
++                        std::to_string(thread) + "." + std::to_string(sequence);
++  temporary_path += path(suffix);
++  return temporary_path;
++}
++
++class TemporaryFileGuard {
++ public:
++  explicit TemporaryFileGuard(path file_path)
++      : file_path_(std::move(file_path)) {}
++  ~TemporaryFileGuard() {
++    if (!committed_) {
++      std::error_code ec;
++      std::filesystem::remove(file_path_, ec);
++    }
++  }
++
++  void Commit() { committed_ = true; }
++
++ private:
++  path file_path_;
++  bool committed_ = false;
++};
++
++bool InstallAtomically(const path& temporary_path,
++                       const path& output_path,
++                       std::error_code* error) {
++  if (!error) {
++    return false;
++  }
++  error->clear();
++  std::filesystem::rename(temporary_path, output_path, *error);
++  if (!*error) {
++    return true;
++  }
++
++#ifdef _WIN32
++  // std::filesystem::rename is not required to replace an existing file on
++  // Windows. MoveFileEx does the replacement without deleting the old pack
++  // first, so a failed install leaves the previous valid pack intact.
++  if (MoveFileExW(temporary_path.wstring().c_str(),
++                  output_path.wstring().c_str(),
++                  MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++    error->clear();
++    return true;
++  }
++  *error =
++      std::error_code(static_cast<int>(GetLastError()), std::system_category());
++#endif
++  return false;
++}
++
++size_t VarUint32Size(uint32_t value) {
++  size_t size = 1;
++  while (value >= 0x80) {
++    value >>= 7;
++    ++size;
++  }
++  return size;
++}
++
++void WriteVarUint32(std::ostream* out, uint32_t value) {
++  char bytes[5];
++  size_t size = 0;
++  while (value >= 0x80) {
++    bytes[size++] = static_cast<char>((value & 0x7f) | 0x80);
++    value >>= 7;
++  }
++  bytes[size++] = static_cast<char>(value);
++  out->write(bytes, size);
++}
++
++inline bool ReadVarUint32(const char* begin,
++                          const char* end,
++                          const char** next,
++                          uint32_t* value) {
++  if (!begin || !end || !next || !value || begin > end) {
++    return false;
++  }
++
++  uint32_t result = 0;
++  unsigned shift = 0;
++  const char* p = begin;
++  for (unsigned i = 0; i < 5 && p < end; ++i, ++p) {
++    const uint8_t byte = static_cast<uint8_t>(*p);
++    if (i == 4 && (byte & 0xf0) != 0) {
++      return false;
++    }
++    result |= static_cast<uint32_t>(byte & 0x7f) << shift;
++    if ((byte & 0x80) == 0) {
++      *next = p + 1;
++      *value = result;
++      return true;
++    }
++    shift += 7;
++  }
++  return false;
++}
++
++uint64_t HashBytes(uint64_t hash, const char* data, size_t size) {
++  constexpr uint64_t kPrime = 1099511628211ULL;
++  for (size_t i = 0; i < size; ++i) {
++    hash ^= static_cast<unsigned char>(data[i]);
++    hash *= kPrime;
++  }
++  return hash;
++}
++
++uint64_t HashU64(uint64_t hash, uint64_t value) {
++  std::array<char, 8> bytes{};
++  for (size_t i = 0; i < bytes.size(); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  return HashBytes(hash, bytes.data(), bytes.size());
++}
++
++uint64_t HashString(uint64_t hash, const string& value) {
++  hash = HashU64(hash, value.size());
++  return HashBytes(hash, value.data(), value.size());
++}
++
++uint64_t ComputeBuildId(const vector<RewriteSectionData>& sections) {
++  uint64_t hash = 1469598103934665603ULL;
++  hash = HashU64(hash, kFormatVersion);
++  hash = HashU64(hash, sections.size());
++  for (const auto& section : sections) {
++    hash = HashString(hash, section.name);
++    hash = HashU64(hash, section.stage.entries.size());
++    for (const auto& entry : section.stage.entries) {
++      hash = HashString(hash, entry.key);
++      hash = HashString(hash, entry.value);
++      hash = HashString(hash, entry.preedit);
++    }
++  }
++  return hash;
++}
++
++bool ReadPackBuildId(const path& file_path, uint64_t* build_id) {
++  if (!build_id) {
++    return false;
++  }
++
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    return false;
++  }
++
++  std::array<char, kHeaderSize> header{};
++  in.read(header.data(), header.size());
++  if (in.gcount() != static_cast<std::streamsize>(header.size()) ||
++      std::memcmp(header.data(), kMagic, sizeof(kMagic)) != 0 ||
++      ReadU32(header.data() + 8) != kFormatVersion) {
++    return false;
++  }
++
++  std::error_code ec;
++  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
++  const uint32_t section_count = ReadU32(header.data() + 12);
++  const uint64_t section_table_offset = ReadU64(header.data() + 16);
++  if (ec || ReadU64(header.data() + 40) != actual_size || section_count == 0 ||
++      section_table_offset < kHeaderSize ||
++      !InRange(section_table_offset,
++               static_cast<uint64_t>(section_count) * kSectionRecordSize,
++               actual_size)) {
++    return false;
++  }
++
++  *build_id = ReadU64(header.data() + 24);
++  return true;
++}
++
++class RewriteMappedFile : public MappedFile {
++ public:
++  explicit RewriteMappedFile(const path& file_path) : MappedFile(file_path) {}
++
++  bool Open() { return OpenReadOnly(); }
++  const char* data() const { return address(); }
++};
++
++struct StageView {
++  marisa::Trie trie;
++  const char* key_index = nullptr;
++  const char* value_pool = nullptr;
++  const char* value_pool_end = nullptr;
++  uint32_t key_count = 0;
++  uint32_t flags = 0;
++
++  static bool ReadValue(const char** cursor,
++                        const char* end,
++                        std::string_view* value) {
++    if (!cursor || !*cursor || !end || !value || *cursor > end) {
++      return false;
++    }
++    uint32_t size = 0;
++    if (!ReadVarUint32(*cursor, end, cursor, &size) ||
++        static_cast<size_t>(end - *cursor) < size) {
++      return false;
++    }
++    *value = std::string_view(*cursor, size);
++    *cursor += size;
++    return true;
++  }
++
++  bool ReadStoredValue(const char** cursor,
++                       const char* end,
++                       std::string_view* preedit,
++                       std::string_view* value) const {
++    if (!preedit || !value) {
++      return false;
++    }
++    *preedit = std::string_view();
++    if ((flags & kStageFlagHasPreedit) != 0 &&
++        !ReadValue(cursor, end, preedit)) {
++      return false;
++    }
++    return ReadValue(cursor, end, value);
++  }
++
++  bool GetValueList(size_t key_id,
++                    const char** begin,
++                    const char** end,
++                    uint32_t* value_count) const {
++    if (!begin || !end || !value_count || !key_index || !value_pool ||
++        !value_pool_end || key_id >= key_count) {
++      return false;
++    }
++
++    const char* index = key_index + key_id * kKeyIndexRecordSize;
++    const uint32_t value_list_offset = ReadU32(index);
++    const uint32_t count = ReadU32(index + 4);
++    const size_t pool_size = static_cast<size_t>(value_pool_end - value_pool);
++    if (count == 0 || value_list_offset >= pool_size) {
++      return false;
++    }
++
++    *begin = value_pool + value_list_offset;
++    *end = value_pool_end;
++    *value_count = count;
++    return true;
++  }
++
++  bool Lookup(std::string_view text,
++              marisa::Agent* agent,
++              vector<string>* values) const {
++    if (!agent || !values) {
++      return false;
++    }
++    values->clear();
++    agent->set_query(text.data(), text.size());
++    if (!trie.lookup(*agent)) {
++      return false;
++    }
++
++    const char* cursor = nullptr;
++    const char* end = nullptr;
++    uint32_t value_count = 0;
++    if (!GetValueList(agent->key().id(), &cursor, &end, &value_count)) {
++      return false;
++    }
++
++    // Single-key lookup preserves every value in source order. Reserve only a
++    // small initial capacity so a damaged pack cannot force a huge allocation
++    // before the bounded value decoder has inspected the pool.
++    values->reserve(std::min<uint32_t>(value_count, 16));
++    for (uint32_t i = 0; i < value_count; ++i) {
++      std::string_view preedit;
++      std::string_view value;
++      if (!ReadStoredValue(&cursor, end, &preedit, &value)) {
++        values->clear();
++        return false;
++      }
++      values->emplace_back(value);
++    }
++    return true;
++  }
++
++  bool LookupWithPreedit(std::string_view text,
++                         marisa::Agent* agent,
++                         vector<RewriteResult>* values) const {
++    if (!agent || !values) {
++      return false;
++    }
++    values->clear();
++    agent->set_query(text.data(), text.size());
++    if (!trie.lookup(*agent)) {
++      return false;
++    }
++
++    const char* cursor = nullptr;
++    const char* end = nullptr;
++    uint32_t value_count = 0;
++    if (!GetValueList(agent->key().id(), &cursor, &end, &value_count)) {
++      return false;
++    }
++
++    values->reserve(std::min<uint32_t>(value_count, 16));
++    for (uint32_t i = 0; i < value_count; ++i) {
++      std::string_view preedit;
++      std::string_view value;
++      if (!ReadStoredValue(&cursor, end, &preedit, &value)) {
++        values->clear();
++        return false;
++      }
++      values->push_back({string(value.data(), value.size()),
++                         string(preedit.data(), preedit.size())});
++    }
++    return true;
++  }
++
++  bool GetFirstValue(size_t key_id, std::string_view* value) const {
++    const char* cursor = nullptr;
++    const char* end = nullptr;
++    uint32_t value_count = 0;
++    if (!GetValueList(key_id, &cursor, &end, &value_count)) {
++      return false;
++    }
++
++    std::string_view preedit;
++    if (!ReadStoredValue(&cursor, end, &preedit, value)) {
++      return false;
++    }
++    return true;
++  }
++
++  bool ConvertSentence(const string& text, string* result) const {
++    result->clear();
++
++    bool changed = false;
++    size_t pos = 0;
++    marisa::Agent agent;
++
++    while (pos < text.size()) {
++      agent.set_query(text.data() + pos, text.size() - pos);
++
++      size_t longest_id = kInvalidIndex;
++      size_t longest_size = 0;
++      while (trie.common_prefix_search(agent)) {
++        const size_t key_size = agent.key().length();
++        if (key_size > longest_size) {
++          longest_id = agent.key().id();
++          longest_size = key_size;
++        }
++      }
++
++      if (longest_id != kInvalidIndex) {
++        std::string_view value;
++        if (GetFirstValue(longest_id, &value)) {
++          const bool replacement_changed =
++              value.size() != longest_size ||
++              std::memcmp(value.data(), text.data() + pos, longest_size) != 0;
++          if (replacement_changed) {
++            if (!changed) {
++              result->reserve(text.size());
++              result->assign(text.data(), pos);
++            }
++            changed = true;
++          }
++          if (changed && !replacement_changed) {
++            result->append(text.data() + pos, longest_size);
++          } else if (changed) {
++            result->append(value.data(), value.size());
++          }
++          pos += longest_size;
++          continue;
++        }
++      }
++
++      const char* current = text.data() + pos;
++      const size_t char_size =
++          NextUtf8CharSize(current, text.data() + text.size());
++      if (char_size == 0) {
++        return changed;
++      }
++      if (changed) {
++        result->append(current, char_size);
++      }
++      pos += char_size;
++    }
++    return changed;
++  }
++};
++
++void WriteSectionRecord(std::ostream* out, const SectionRecord& record) {
++  WriteU64(out, record.name_offset);
++  WriteU32(out, record.name_size);
++  WriteU32(out, record.stage_count);
++  WriteU64(out, record.stage_table_offset);
++}
++
++void WriteStageRecord(std::ostream* out, const StageRecord& record) {
++  WriteU64(out, record.trie_offset);
++  WriteU64(out, record.trie_size);
++  WriteU64(out, record.key_index_offset);
++  WriteU32(out, record.key_count);
++  WriteU32(out, record.flags);
++  WriteU64(out, record.value_pool_offset);
++  WriteU64(out, record.value_pool_size);
++  WriteU64(out, 0);
++  WriteU64(out, 0);
++}
++
++}  // namespace
++
++class RewriteSection::Impl {
++ public:
++  // One section is one pipeline stage. Stage order belongs to engine/filters.
++  StageView stage;
++};
++
++RewriteSection::RewriteSection() : impl_(new Impl) {}
++RewriteSection::~RewriteSection() = default;
++
++bool RewriteSection::Lookup(const string& text, vector<string>* values) const {
++  if (!values) {
++    return false;
++  }
++  values->clear();
++  if (text.empty()) {
++    return false;
++  }
++  marisa::Agent agent;
++  return impl_->stage.Lookup(text, &agent, values);
++}
++
++bool RewriteSection::LookupWithPreedit(const string& text,
++                                       vector<RewriteResult>* values) const {
++  if (!values) {
++    return false;
++  }
++  values->clear();
++  if (text.empty()) {
++    return false;
++  }
++  marisa::Agent agent;
++  return impl_->stage.LookupWithPreedit(text, &agent, values);
++}
++
++bool RewriteSection::ConvertSentence(const string& text, string* result) const {
++  if (!result) {
++    return false;
++  }
++  result->clear();
++  if (text.empty()) {
++    return false;
++  }
++  return impl_->stage.ConvertSentence(text, result);
++}
++
++class RewritePack::Impl {
++ public:
++  // Destroy stages and mapped name views before releasing the shared mapping.
++  std::unique_ptr<RewriteMappedFile> file;
++  // Built only by Open(). Each stage owns one independent mapped trie/view;
++  // pointees stay at fixed addresses and the index is read-only after loading.
++  std::unordered_map<std::string_view, std::unique_ptr<RewriteSection>>
++      sections;
++};
++
++RewritePack::RewritePack(const path& file_path)
++    : file_path_(file_path), impl_(new Impl) {}
++
++RewritePack::~RewritePack() = default;
++
++bool RewritePack::Open() {
++  impl_->file = std::make_unique<RewriteMappedFile>(file_path_);
++  if (!impl_->file->Open()) {
++    LOG(ERROR) << "cannot open rewrite pack '" << file_path_
++               << "'; the file is missing, unreadable, or cannot be memory "
++                  "mapped. Redeploy the schema to rebuild it.";
++    return false;
++  }
++
++  const char* base = impl_->file->data();
++  const uint64_t file_size = impl_->file->file_size();
++  if (!base || file_size < kHeaderSize) {
++    LOG(ERROR) << "rewrite pack '" << file_path_
++               << "' is truncated or has no valid RWP header; redeploy the "
++                  "schema to rebuild this generated file.";
++    return false;
++  }
++  if (std::memcmp(base, kMagic, sizeof(kMagic)) != 0) {
++    if (std::memcmp(base, kMagic, sizeof(kMagic) - 1) == 0) {
++      LOG(ERROR) << "rewrite pack '" << file_path_ << "' uses incompatible "
++                 << "format marker '" << std::string_view(base, sizeof(kMagic))
++                 << "' (expected '" << std::string_view(kMagic, sizeof(kMagic))
++                 << "'); redeploy the schema to rebuild the pack.";
++    } else {
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' has an invalid RWP header; redeploy the schema to "
++                    "rebuild this generated file.";
++    }
++    return false;
++  }
++
++  const uint32_t version = ReadU32(base + 8);
++  if (version != kFormatVersion) {
++    LOG(ERROR) << "rewrite pack '" << file_path_ << "' uses format version "
++               << version << ", but this build expects version "
++               << kFormatVersion
++               << "; redeploy the schema to rebuild the pack.";
++    return false;
++  }
++
++  const uint32_t section_count = ReadU32(base + 12);
++  const uint64_t section_table_offset = ReadU64(base + 16);
++  build_id_ = ReadU64(base + 24);
++  const uint64_t source_checksum = ReadU64(base + 32);
++  (void)source_checksum;
++  const uint64_t declared_file_size = ReadU64(base + 40);
++  if (section_count == 0 || declared_file_size != file_size ||
++      section_table_offset < kHeaderSize ||
++      !InRange(section_table_offset,
++               static_cast<uint64_t>(section_count) * kSectionRecordSize,
++               file_size)) {
++    LOG(ERROR) << "rewrite pack '" << file_path_
++               << "' has a corrupted section directory; redeploy the schema "
++                  "to rebuild the pack.";
++    return false;
++  }
++
++  impl_->sections.clear();
++  impl_->sections.reserve(section_count);
++
++  for (uint32_t i = 0; i < section_count; ++i) {
++    const char* p = base + section_table_offset + i * kSectionRecordSize;
++    SectionRecord section_record;
++    section_record.name_offset = ReadU64(p);
++    section_record.name_size = ReadU32(p + 8);
++    section_record.stage_count = ReadU32(p + 12);
++    section_record.stage_table_offset = ReadU64(p + 16);
++
++    if (!InRange(section_record.name_offset, section_record.name_size,
++                 file_size) ||
++        !InRange(section_record.stage_table_offset,
++                 static_cast<uint64_t>(section_record.stage_count) *
++                     kStageRecordSize,
++                 file_size)) {
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' contains an out-of-range section entry; redeploy the "
++                    "schema to rebuild the pack.";
++      return false;
++    }
++
++    const std::string_view name(base + section_record.name_offset,
++                                section_record.name_size);
++    if (name.empty() || section_record.stage_count != 1) {
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' contains an invalid section entry; redeploy the schema "
++                    "to rebuild the pack.";
++      return false;
++    }
++    if (impl_->sections.find(name) != impl_->sections.end()) {
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' contains duplicate section '" << name
++                 << "'; redeploy the schema to rebuild the pack.";
++      return false;
++    }
++
++    auto section = std::unique_ptr<RewriteSection>(new RewriteSection);
++    const char* sp = base + section_record.stage_table_offset;
++    StageRecord stage_record;
++    stage_record.trie_offset = ReadU64(sp);
++    stage_record.trie_size = ReadU64(sp + 8);
++    stage_record.key_index_offset = ReadU64(sp + 16);
++    stage_record.key_count = ReadU32(sp + 24);
++    stage_record.flags = ReadU32(sp + 28);
++    stage_record.value_pool_offset = ReadU64(sp + 32);
++    stage_record.value_pool_size = ReadU64(sp + 40);
++
++    if (stage_record.key_count == 0 || stage_record.trie_size == 0 ||
++        stage_record.value_pool_size == 0 ||
++        (stage_record.flags & ~kKnownStageFlags) != 0 ||
++        !InRange(stage_record.trie_offset, stage_record.trie_size, file_size) ||
++        !InRange(
++            stage_record.key_index_offset,
++            static_cast<uint64_t>(stage_record.key_count) * kKeyIndexRecordSize,
++            file_size) ||
++        !InRange(stage_record.value_pool_offset, stage_record.value_pool_size,
++                 file_size)) {
++      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
++                 << "stage metadata in section '" << name
++                 << "'; redeploy the schema to rebuild the pack.";
++      return false;
++    }
++
++    StageView& stage = section->impl_->stage;
++    stage.key_index = base + stage_record.key_index_offset;
++    stage.value_pool = base + stage_record.value_pool_offset;
++    stage.value_pool_end = stage.value_pool + stage_record.value_pool_size;
++    stage.key_count = stage_record.key_count;
++    stage.flags = stage_record.flags;
++
++    try {
++      stage.trie.map(base + stage_record.trie_offset, stage_record.trie_size);
++    } catch (const std::exception& ex) {
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' cannot map trie for section '" << name
++                 << "': " << ex.what()
++                 << "; redeploy the schema to rebuild the pack.";
++      return false;
++    } catch (...) {
++      // marisa's public API is not required to use std::exception for every
++      // malformed-input failure. A damaged pack must fail open cleanly.
++      LOG(ERROR) << "rewrite pack '" << file_path_
++                 << "' cannot map trie for section '" << name
++                 << "' due to an unknown error; redeploy the schema to "
++                    "rebuild the pack.";
++      return false;
++    }
++
++    if (stage.trie.num_keys() != stage.key_count) {
++      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
++                 << "stage metadata in section '" << name
++                 << "'; redeploy the schema to rebuild the pack.";
++      return false;
++    }
++
++    // Do not scan key/value records here. The pack is memory-mapped so values
++    // stay demand-paged; GetValueList()/ReadValue() validate the actually hit
++    // record lazily on the query path. This keeps first open proportional to
++    // section metadata and trie mapping rather than total dictionary size.
++
++    impl_->sections.emplace(name, std::move(section));
++  }
++  return true;
++}
++
++std::shared_ptr<RewritePack> RewritePack::OpenCached(const path& file_path) {
++  static std::mutex mutex;
++  static std::unordered_map<string, std::weak_ptr<RewritePack>> cache;
++
++  // Use a stable UTF-8 key for cache identity. The path itself is still passed
++  // to MappedFile, so native Unicode path handling remains platform-specific.
++  const string cache_key = file_path.u8string();
++  uint64_t on_disk_build_id = 0;
++  const bool has_build_id = ReadPackBuildId(file_path, &on_disk_build_id);
++
++  {
++    // Mapping MARISA tries may still touch pack metadata. Do not hold the
++    // process-wide cache mutex while doing that work; concurrent misses may
++    // build duplicate short-lived mappings, but startup is not serialized.
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = cache.find(cache_key);
++    if (found != cache.end()) {
++      if (auto cached = found->second.lock()) {
++        if (has_build_id && cached->build_id() == on_disk_build_id) {
++          return cached;
++        }
++      }
++      cache.erase(found);
++    }
++  }
++
++  auto pack = std::shared_ptr<RewritePack>(new RewritePack(file_path));
++  if (!pack->Open()) {
++    return nullptr;
++  }
++
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = cache.find(cache_key);
++    if (found != cache.end()) {
++      if (auto cached = found->second.lock()) {
++        if (cached->build_id() == pack->build_id()) {
++          return cached;
++        }
++      }
++    }
++    cache[cache_key] = pack;
++  }
++  return pack;
++}
++
++RewritePack::StageHandle RewritePack::FindSection(const string& name) const {
++  const std::string_view wanted(name.data(), name.size());
++  const auto& sections = impl_->sections;
++  const auto found = sections.find(wanted);
++  return found == sections.end() ? nullptr : found->second.get();
++}
++
++namespace {
++
++bool BuildRewritePackInternal(const path& output_path,
++                              const vector<RewriteSectionData>& sections,
++                              uint64_t source_checksum) {
++  if (sections.empty() || !FitsU32(sections.size())) {
++    LOG(ERROR) << "cannot build rewrite pack: section list is empty or exceeds "
++                  "the RWP format limit.";
++    return false;
++  }
++
++  std::unordered_set<string> section_names;
++  section_names.reserve(sections.size());
++  for (const auto& section : sections) {
++    if (section.name.empty() || !FitsU32(section.name.size()) ||
++        section.stage.entries.empty() ||
++        !section_names.insert(section.name).second) {
++      LOG(ERROR) << "cannot build rewrite section '" << section.name
++                 << "': section name is empty, duplicated, too long, or the "
++                    "section contains no usable entries.";
++      return false;
++    }
++  }
++
++  const uint64_t build_id = ComputeBuildId(sections);
++  // Always emit a fresh pack. A matching build id only describes the source
++  // entries; it cannot prove that an existing MARISA body was not truncated
++  // or modified in place. Re-opening that untrusted body during deployment
++  // can crash inside marisa::Trie::map before we get a C++ exception. The
++  // deployment path is cold, while the runtime keeps its mmap/cache fast.
++
++  std::error_code ec;
++  const path parent_path = output_path.parent_path();
++  if (!parent_path.empty()) {
++    std::filesystem::create_directories(parent_path, ec);
++    if (ec) {
++      LOG(ERROR) << "cannot create rewrite pack directory '" << parent_path
++                 << "': " << ec.message()
++                 << "; check directory permissions and available storage.";
++      return false;
++    }
++  }
++
++  const path temporary_path = MakeTemporaryPath(output_path);
++  TemporaryFileGuard temporary_file(temporary_path);
++  std::ofstream out(static_cast<const std::filesystem::path&>(temporary_path),
++                    std::ios::binary | std::ios::trunc);
++  if (!out) {
++    LOG(ERROR) << "cannot create temporary rewrite pack '" << temporary_path
++               << "'; check directory permissions and available storage.";
++    return false;
++  }
++
++  out.write(kMagic, sizeof(kMagic));
++  WriteU32(&out, kFormatVersion);
++  WriteU32(&out, static_cast<uint32_t>(sections.size()));
++  WriteU64(&out, kHeaderSize);
++  WriteU64(&out, build_id);
++  WriteU64(&out, source_checksum);
++  WriteU64(&out, 0);
++
++  const uint64_t section_table_offset = Tell(&out);
++  WriteZeros(&out, sections.size() * kSectionRecordSize);
++  vector<SectionRecord> section_records(sections.size());
++
++  for (size_t section_index = 0; section_index < sections.size();
++       ++section_index) {
++    const auto& source_section = sections[section_index];
++    auto& section_record = section_records[section_index];
++
++    section_record.name_offset = Tell(&out);
++    section_record.name_size =
++        static_cast<uint32_t>(source_section.name.size());
++    out.write(source_section.name.data(), source_section.name.size());
++
++    section_record.stage_count = 1;
++    section_record.stage_table_offset = Tell(&out);
++    WriteZeros(&out, kStageRecordSize);
++    StageRecord stage_record;
++    const auto& source_stage = source_section.stage;
++    const bool has_preedit =
++        std::any_of(source_stage.entries.begin(), source_stage.entries.end(),
++                    [](const auto& entry) { return !entry.preedit.empty(); });
++    if (has_preedit) {
++      stage_record.flags |= kStageFlagHasPreedit;
++    }
++
++    // Views point into immutable source_stage.entries, avoiding a second
++    // copy of every key/value while compiling. A tiny linear scan dedups
++    // values per key; real rewrite dictionaries overwhelmingly have one
++    // value per key, so this is cheaper than an unordered_set per bucket.
++    struct StoredValue {
++      std::string_view value;
++      std::string_view preedit;
++    };
++    struct Bucket {
++      std::string_view key;
++      vector<StoredValue> values;
++    };
++
++    vector<Bucket> buckets;
++    std::unordered_map<std::string_view, size_t> key_to_bucket;
++    buckets.reserve(source_stage.entries.size());
++    key_to_bucket.reserve(source_stage.entries.size());
++
++    for (const auto& entry : source_stage.entries) {
++      if (entry.key.empty() || entry.value.empty()) {
++        continue;
++      }
++
++      const std::string_view key(entry.key.data(), entry.key.size());
++      const std::string_view value(entry.value.data(), entry.value.size());
++      const std::string_view preedit(entry.preedit.data(),
++                                     entry.preedit.size());
++      auto found = key_to_bucket.find(key);
++      size_t bucket_index = 0;
++      if (found == key_to_bucket.end()) {
++        bucket_index = buckets.size();
++        key_to_bucket.emplace(key, bucket_index);
++        buckets.push_back(Bucket{key, {}});
++      } else {
++        bucket_index = found->second;
++      }
++
++      auto& values = buckets[bucket_index].values;
++      const auto duplicate =
++          std::find_if(values.begin(), values.end(),
++                       [&](const auto& item) { return item.value == value; });
++      if (duplicate == values.end()) {
++        values.push_back({value, preedit});
++      }
++    }
++
++    if (buckets.empty() || !FitsU32(buckets.size())) {
++      LOG(ERROR) << "cannot build rewrite section '" << source_section.name
++                 << "': no usable keys remain or the key count exceeds the "
++                    "RWP format limit.";
++      return false;
++    }
++
++    // Use MARISA directly. The Keyset receives each unique key once;
++    // after build(), MARISA writes the generated key id back to Keyset.
++    // This avoids StringTableBuilder's reference array and its intermediate
++    // stringstream/vector dump while preserving exactly the same trie model.
++    marisa::Keyset keyset;
++    for (const auto& bucket : buckets) {
++      keyset.push_back(bucket.key.data(), bucket.key.size(), 1.0f);
++    }
++
++    marisa::Trie trie;
++    try {
++      LOG(INFO) << "building rewrite trie '" << source_section.name << "' with "
++                << buckets.size() << " keys.";
++      trie.build(keyset);
++    } catch (const std::exception& ex) {
++      LOG(ERROR) << "cannot build rewrite trie for section '"
++                 << source_section.name << "': " << ex.what()
++                 << "; check source size/content or available memory.";
++      return false;
++    } catch (...) {
++      LOG(ERROR) << "cannot build rewrite trie for section '"
++                 << source_section.name
++                 << "' due to an unknown error; the pack was not installed.";
++      return false;
++    }
++
++    if (trie.num_keys() != buckets.size()) {
++      LOG(ERROR) << "internal rewrite trie key-count mismatch in section '"
++                 << source_section.name << "'; the pack was not installed.";
++      return false;
++    }
++
++    vector<size_t> bucket_by_key_id(buckets.size(), kInvalidIndex);
++    for (size_t i = 0; i < buckets.size(); ++i) {
++      const size_t key_id = keyset[i].id();
++      if (key_id >= bucket_by_key_id.size() ||
++          bucket_by_key_id[key_id] != kInvalidIndex) {
++        LOG(ERROR) << "internal rewrite trie key-id collision in section '"
++                   << source_section.name << "'; the pack was not installed.";
++        return false;
++      }
++      bucket_by_key_id[key_id] = i;
++    }
++
++    // The RWP itself owns the single OS mapping. Serialize MARISA directly
++    // into the pack stream instead of materializing another trie-sized byte
++    // vector in deployment memory.
++    Align(&out, alignof(uint64_t));
++    stage_record.trie_offset = Tell(&out);
++    stage_record.trie_size = trie.io_size();
++    try {
++      marisa::write(out, trie);
++    } catch (const std::exception& ex) {
++      LOG(ERROR) << "cannot serialize rewrite trie for section '"
++                 << source_section.name << "': " << ex.what()
++                 << "; check available storage and filesystem health.";
++      return false;
++    } catch (...) {
++      LOG(ERROR) << "cannot serialize rewrite trie for section '"
++                 << source_section.name
++                 << "' due to an unknown error; the pack was not installed.";
++      return false;
++    }
++    if (!out ||
++        Tell(&out) != stage_record.trie_offset + stage_record.trie_size) {
++      LOG(ERROR) << "internal rewrite trie serialization size mismatch in "
++                 << "section '" << source_section.name
++                 << "'; the pack was not installed.";
++      return false;
++    }
++
++    stage_record.key_index_offset = Tell(&out);
++    stage_record.key_count = static_cast<uint32_t>(buckets.size());
++
++    uint64_t value_pool_size = 0;
++    for (size_t key_id = 0; key_id < bucket_by_key_id.size(); ++key_id) {
++      const size_t bucket_index = bucket_by_key_id[key_id];
++      if (bucket_index == kInvalidIndex) {
++        LOG(ERROR) << "internal rewrite trie contains an unmapped key id in "
++                   << "section '" << source_section.name
++                   << "'; the pack was not installed.";
++        return false;
++      }
++
++      const auto& values = buckets[bucket_index].values;
++      if (values.empty() || !FitsU32(values.size()) ||
++          value_pool_size > std::numeric_limits<uint32_t>::max()) {
++        LOG(ERROR) << "rewrite value list in section '" << source_section.name
++                   << "' is empty or exceeds the RWP format limit; reduce "
++                      "values for a single key or split the source.";
++        return false;
++      }
++
++      WriteU32(&out, static_cast<uint32_t>(value_pool_size));
++      WriteU32(&out, static_cast<uint32_t>(values.size()));
++
++      for (const auto& item : values) {
++        if (!FitsU32(item.preedit.size()) || !FitsU32(item.value.size())) {
++          LOG(ERROR) << "rewrite value or stored preedit in section '"
++                     << source_section.name
++                     << "' exceeds the RWP format limit.";
++          return false;
++        }
++        uint64_t encoded_size = 0;
++        if (has_preedit) {
++          encoded_size +=
++              VarUint32Size(static_cast<uint32_t>(item.preedit.size())) +
++              static_cast<uint64_t>(item.preedit.size());
++        }
++        encoded_size +=
++            VarUint32Size(static_cast<uint32_t>(item.value.size())) +
++            static_cast<uint64_t>(item.value.size());
++        if (encoded_size >
++            std::numeric_limits<uint32_t>::max() - value_pool_size) {
++          LOG(ERROR) << "rewrite value pool in section '" << source_section.name
++                     << "' exceeds the 4 GiB RWP format limit; split the "
++                        "rewrite data into smaller sections.";
++          return false;
++        }
++        value_pool_size += encoded_size;
++      }
++    }
++
++    stage_record.value_pool_offset = Tell(&out);
++    stage_record.value_pool_size = value_pool_size;
++    for (size_t key_id = 0; key_id < bucket_by_key_id.size(); ++key_id) {
++      const auto& values = buckets[bucket_by_key_id[key_id]].values;
++      for (const auto& item : values) {
++        if (has_preedit) {
++          WriteVarUint32(&out, static_cast<uint32_t>(item.preedit.size()));
++          out.write(item.preedit.data(), item.preedit.size());
++        }
++        WriteVarUint32(&out, static_cast<uint32_t>(item.value.size()));
++        out.write(item.value.data(), item.value.size());
++      }
++    }
++    if (!out || Tell(&out) != stage_record.value_pool_offset +
++                                  stage_record.value_pool_size) {
++      LOG(ERROR) << "internal rewrite value-pool size mismatch in section '"
++                 << source_section.name << "'; the pack was not installed.";
++      return false;
++    }
++    const uint64_t return_pos = Tell(&out);
++    out.seekp(section_record.stage_table_offset);
++    if (!out) {
++      LOG(ERROR) << "failed to write rewrite stage table for section '"
++                 << source_section.name
++                 << "'; check available storage and filesystem health.";
++      return false;
++    }
++    WriteStageRecord(&out, stage_record);
++    out.seekp(return_pos);
++    if (!out) {
++      LOG(ERROR) << "failed to continue writing rewrite section '"
++                 << source_section.name
++                 << "'; check available storage and filesystem health.";
++      return false;
++    }
++  }
++
++  const uint64_t file_size = Tell(&out);
++  out.seekp(section_table_offset);
++  if (!out) {
++    LOG(ERROR) << "failed to finalize rewrite section table for '"
++               << output_path
++               << "'; check available storage and filesystem health.";
++    return false;
++  }
++  for (const auto& section_record : section_records) {
++    WriteSectionRecord(&out, section_record);
++  }
++  out.seekp(40);
++  if (!out) {
++    LOG(ERROR) << "failed to finalize rewrite pack header for '" << output_path
++               << "'; check available storage and filesystem health.";
++    return false;
++  }
++  WriteU64(&out, file_size);
++  out.close();
++
++  if (!out) {
++    LOG(ERROR) << "failed to finish writing temporary rewrite pack '"
++               << temporary_path
++               << "'; check available storage and filesystem health.";
++    return false;
++  }
++
++  // Rename within the same directory is atomic on POSIX. On Windows the
++  // platform replacement API is used without deleting the old file first;
++  // if a live mapping prevents replacement, deployment fails and the old
++  // pack remains available.
++  if (!InstallAtomically(temporary_path, output_path, &ec)) {
++    LOG(ERROR) << "cannot install rewrite pack '" << output_path
++               << "': " << ec.message()
++               << "; the previous pack was left unchanged. Check file "
++                  "permissions and whether another process is holding the "
++                  "file.";
++    return false;
++  }
++  temporary_file.Commit();
++  return true;
++}
++
++}  // namespace
++
++bool RewritePackBuilder::IsUpToDate(const path& file_path,
++                                    uint64_t source_checksum) {
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    return false;
++  }
++
++  std::array<char, kHeaderSize> header{};
++  in.read(header.data(), header.size());
++  if (in.gcount() != static_cast<std::streamsize>(header.size()) ||
++      std::memcmp(header.data(), kMagic, sizeof(kMagic)) != 0 ||
++      ReadU32(header.data() + 8) != kFormatVersion ||
++      ReadU64(header.data() + 32) != source_checksum) {
++    return false;
++  }
++
++  std::error_code ec;
++  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
++  if (ec || actual_size < kHeaderSize ||
++      ReadU64(header.data() + 40) != actual_size) {
++    return false;
++  }
++
++  const uint32_t section_count = ReadU32(header.data() + 12);
++  const uint64_t section_table_offset = ReadU64(header.data() + 16);
++  if (section_count == 0 || section_table_offset < kHeaderSize ||
++      !InRange(section_table_offset,
++               static_cast<uint64_t>(section_count) * kSectionRecordSize,
++               actual_size)) {
++    return false;
++  }
++
++  std::unordered_set<string> section_names;
++  section_names.reserve(section_count);
++  for (uint32_t i = 0; i < section_count; ++i) {
++    std::array<char, kSectionRecordSize> section_bytes{};
++    in.seekg(static_cast<std::streamoff>(
++        section_table_offset + static_cast<uint64_t>(i) * kSectionRecordSize));
++    in.read(section_bytes.data(), section_bytes.size());
++    if (!in) {
++      return false;
++    }
++
++    const uint64_t name_offset = ReadU64(section_bytes.data());
++    const uint32_t name_size = ReadU32(section_bytes.data() + 8);
++    const uint32_t stage_count = ReadU32(section_bytes.data() + 12);
++    const uint64_t stage_table_offset = ReadU64(section_bytes.data() + 16);
++    if (name_size == 0 || stage_count != 1 ||
++        !InRange(name_offset, name_size, actual_size) ||
++        !InRange(stage_table_offset, kStageRecordSize, actual_size)) {
++      return false;
++    }
++
++    string name(name_size, '\0');
++    in.seekg(static_cast<std::streamoff>(name_offset));
++    in.read(name.data(), static_cast<std::streamsize>(name.size()));
++    if (!in || !section_names.insert(name).second) {
++      return false;
++    }
++
++    std::array<char, kStageRecordSize> stage_bytes{};
++    in.seekg(static_cast<std::streamoff>(stage_table_offset));
++    in.read(stage_bytes.data(), stage_bytes.size());
++    if (!in) {
++      return false;
++    }
++
++    const uint64_t trie_offset = ReadU64(stage_bytes.data());
++    const uint64_t trie_size = ReadU64(stage_bytes.data() + 8);
++    const uint64_t key_index_offset = ReadU64(stage_bytes.data() + 16);
++    const uint32_t key_count = ReadU32(stage_bytes.data() + 24);
++    const uint32_t flags = ReadU32(stage_bytes.data() + 28);
++    const uint64_t value_pool_offset = ReadU64(stage_bytes.data() + 32);
++    const uint64_t value_pool_size = ReadU64(stage_bytes.data() + 40);
++    if (key_count == 0 || trie_size == 0 || value_pool_size == 0 ||
++        (flags & ~kKnownStageFlags) != 0 ||
++        !InRange(trie_offset, trie_size, actual_size) ||
++        !InRange(key_index_offset,
++                 static_cast<uint64_t>(key_count) * kKeyIndexRecordSize,
++                 actual_size) ||
++        !InRange(value_pool_offset, value_pool_size, actual_size)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool RewritePackBuilder::Build(const path& output_path,
++                               const vector<RewriteSectionData>& sections,
++                               uint64_t source_checksum) const {
++  return BuildRewritePackInternal(output_path, sections, source_checksum);
++}
++
++bool RewritePackBuilder::Build(
++    const path& output_path,
++    const vector<RewriteSectionData>& sections) const {
++  return BuildRewritePackInternal(output_path, sections, 0);
++}
++
++}  // namespace rime
+diff --git a/src/rime/dict/rewrite_pack.h b/src/rime/dict/rewrite_pack.h
+new file mode 100644
+index 00000000..8b5986f9
+--- /dev/null
++++ b/src/rime/dict/rewrite_pack.h
+@@ -0,0 +1,100 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#ifndef RIME_REWRITE_PACK_H_
++#define RIME_REWRITE_PACK_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <rime_api.h>
++#include <rime/common.h>
++
++namespace rime {
++
++struct RewriteEntry {
++  string key;
++  string value;
++  // Original spelling retained when deployment converts the lookup key.
++  string preedit;
++};
++
++struct RewriteResult {
++  string value;
++  string preedit;
++};
++
++struct RewriteStageData {
++  vector<RewriteEntry> entries;
++};
++
++struct RewriteSectionData {
++  string name;
++  // Exactly one stage belongs to a section. Pipeline order is supplied by
++  // engine/filters, not encoded as a conversion chain here.
++  RewriteStageData stage;
++};
++
++class RewriteSection;
++
++class RIME_DLL RewritePack {
++ public:
++  // Non-owning, read-only stage pointer. Keep this pack alive while using it.
++  // Resolve once at filter initialization; queries do not revisit the index.
++  using StageHandle = const RewriteSection*;
++
++  ~RewritePack();
++
++  static std::shared_ptr<RewritePack> OpenCached(const path& file_path);
++
++  StageHandle FindSection(const string& name) const;
++  const path& file_path() const { return file_path_; }
++  uint64_t build_id() const { return build_id_; }
++
++ private:
++  friend class RewritePackBuilder;
++  class Impl;
++
++  explicit RewritePack(const path& file_path);
++  bool Open();
++
++  path file_path_;
++  uint64_t build_id_ = 0;
++  std::unique_ptr<Impl> impl_;
++};
++
++class RIME_DLL RewriteSection {
++ public:
++  ~RewriteSection();
++
++  // Read only this stage's mapped trie and values, with a query-local Agent.
++  bool Lookup(const string& text, vector<string>* values) const;
++  bool LookupWithPreedit(const string& text,
++                         vector<RewriteResult>* values) const;
++  bool ConvertSentence(const string& text, string* result) const;
++
++ private:
++  friend class RewritePack;
++  class Impl;
++
++  RewriteSection();
++  std::unique_ptr<Impl> impl_;
++};
++
++class RIME_DLL RewritePackBuilder {
++ public:
++  static bool IsUpToDate(const path& file_path, uint64_t source_checksum);
++
++  bool Build(const path& output_path,
++             const vector<RewriteSectionData>& sections) const;
++  bool Build(const path& output_path,
++             const vector<RewriteSectionData>& sections,
++             uint64_t source_checksum) const;
++};
++
++}  // namespace rime
++
++#endif  // RIME_REWRITE_PACK_H_
+diff --git a/src/rime/gear/gears_module.cc b/src/rime/gear/gears_module.cc
+index 4aa5d1db..ab77c587 100644
+--- a/src/rime/gear/gears_module.cc
++++ b/src/rime/gear/gears_module.cc
+@@ -23,6 +23,7 @@
+ #include <rime/gear/recognizer.h>
+ #include <rime/gear/reverse_lookup_filter.h>
+ #include <rime/gear/reverse_lookup_translator.h>
++#include <rime/gear/rewriter.h>
+ #include <rime/gear/schema_list_translator.h>
+ #include <rime/gear/script_translator.h>
+ #include <rime/gear/selector.h>
+@@ -80,6 +81,7 @@ static void rime_gears_initialize() {
+   r.Register("history_translator", new Component<HistoryTranslator>);
+ 
+   // filters
++  r.Register("rewriter", new RewriterComponent);
+   r.Register("simplifier", new SimplifierComponent);
+   r.Register("uniquifier", new Component<Uniquifier>);
+   if (!r.Find("charset_filter")) {  // allow improved implementation
+diff --git a/src/rime/gear/rewriter.cc b/src/rime/gear/rewriter.cc
+new file mode 100644
+index 00000000..85d2fea1
+--- /dev/null
++++ b/src/rime/gear/rewriter.cc
+@@ -0,0 +1,476 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#include <rime/gear/rewriter.h>
++
++#include <algorithm>
++#include <deque>
++#include <unordered_set>
++
++#include <rime/candidate.h>
++#include <rime/composition.h>
++#include <rime/config.h>
++#include <rime/context.h>
++#include <rime/engine.h>
++#include <rime/resource.h>
++#include <rime/schema.h>
++#include <rime/service.h>
++#include <rime/translation.h>
++#include <rime/dict/rewrite_pack.h>
++
++namespace rime {
++namespace {
++
++string Join(const vector<string>& values, const char* separator) {
++  string result;
++  for (size_t i = 0; i < values.size(); ++i) {
++    if (i != 0) {
++      result.append(separator);
++    }
++    result.append(values[i]);
++  }
++  return result;
++}
++
++void ReadStringList(Config* config, const string& key, vector<string>* values) {
++  values->clear();
++  const auto item = config->GetItem(key);
++  if (auto value = As<ConfigValue>(item)) {
++    if (!value->str().empty()) {
++      values->push_back(value->str());
++    }
++    return;
++  }
++  if (auto list = As<ConfigList>(item)) {
++    for (size_t i = 0; i < list->size(); ++i) {
++      if (auto value = As<ConfigValue>(list->GetAt(i))) {
++        if (!value->str().empty()) {
++          values->push_back(value->str());
++        }
++      }
++    }
++  }
++}
++
++path ResolvePackPath(const string& schema_id) {
++  the<ResourceResolver> resolver(
++      Service::instance().CreateDeployedResourceResolver(
++          {"rewrite_pack", "", ".rwp"}));
++  return resolver ? resolver->ResolvePath(schema_id) : path();
++}
++
++}  // namespace
++
++class RewriterTranslation : public PrefetchTranslation {
++ public:
++  RewriterTranslation(an<Translation> translation, const Rewriter* rewriter)
++      : PrefetchTranslation(translation), rewriter_(rewriter) {}
++
++ protected:
++  bool Replenish() override {
++    auto candidate = translation_->Peek();
++    translation_->Next();
++    if (!candidate) {
++      return false;
++    }
++    if (!rewriter_->Transform(candidate, &cache_)) {
++      cache_.push_back(candidate);
++    }
++    return !cache_.empty();
++  }
++
++ private:
++  const Rewriter* rewriter_;
++};
++
++class RewriterAbbrevTranslation : public Translation {
++ public:
++  RewriterAbbrevTranslation(an<Translation> translation,
++                            const Rewriter* rewriter,
++                            Context* context)
++      : translation_(translation), rewriter_(rewriter), context_(context) {
++    BuildInjectedCandidates();
++    PrepareNext();
++  }
++
++  an<Candidate> Peek() override { return current_; }
++
++  bool Next() override {
++    if (exhausted()) {
++      return false;
++    }
++    if (current_is_injected_) {
++      ++injected_index_;
++      if (!release_all_ && injected_index_ >= front_limit_) {
++        injected_index_ = injected_.size();
++      }
++    } else {
++      ++regular_yielded_;
++    }
++    current_.reset();
++    PrepareNext();
++    return !exhausted();
++  }
++
++ private:
++  void BuildInjectedCandidates() {
++    if (!rewriter_->stage_ || !context_ || context_->input().empty()) {
++      return;
++    }
++
++    size_t start = 0;
++    size_t end = context_->input().size();
++    if (!context_->composition().empty()) {
++      const Segment& segment = context_->composition().back();
++      start = segment.start;
++      end = segment.end;
++    }
++    if (end <= start || end > context_->input().size()) {
++      return;
++    }
++
++    const string input = context_->input().substr(start, end - start);
++    vector<RewriteResult> values;
++    if (!rewriter_->stage_->LookupWithPreedit(input, &values)) {
++      return;
++    }
++    std::unordered_set<string> seen;
++    for (const auto& value : values) {
++      if (value.value.empty() || !seen.insert(value.value).second) {
++        continue;
++      }
++      const string type = rewriter_->options_.cand_type.empty()
++                              ? "abbrev"
++                              : rewriter_->options_.cand_type;
++      auto candidate = New<SimpleCandidate>(type, start, end, value.value,
++                                            string(), value.preedit);
++      injected_.push_back(candidate);
++    }
++    front_limit_ = std::min(rewriter_->options_.count, injected_.size());
++  }
++
++  void PrepareNext() {
++    while (!current_) {
++      // Peek once at the first visible candidate. prefer_types is explicitly
++      // configured because a filter cannot otherwise know translator priority.
++      if (!first_candidate_checked_) {
++        first_candidate_checked_ = true;
++        if (translation_) {
++          first_candidate_ = translation_->Peek();
++          if (first_candidate_ &&
++              rewriter_->options_.prefer_types.find(first_candidate_->type()) !=
++                  rewriter_->options_.prefer_types.end()) {
++            insertion_started_ = true;
++            release_all_ = true;
++            front_limit_ = injected_.size();
++          }
++        }
++      }
++
++      if (!injected_.empty() && injected_index_ < injected_.size()) {
++        if (release_all_ || insertion_started_) {
++          current_ = injected_[injected_index_];
++          current_is_injected_ = true;
++          break;
++        }
++        const bool has_regular_candidate =
++            first_candidate_ || regular_yielded_ > 0 ||
++            (translation_ && !translation_->exhausted());
++        if (has_regular_candidate) {
++          const size_t before = rewriter_->options_.position > 0
++                                    ? rewriter_->options_.position - 1
++                                    : 0;
++          if (regular_yielded_ >= before) {
++            insertion_started_ = true;
++            current_ = injected_[injected_index_];
++            current_is_injected_ = true;
++            break;
++          }
++        }
++      }
++
++      if (translation_ && (first_candidate_ || !translation_->exhausted())) {
++        if (first_candidate_) {
++          current_ = first_candidate_;
++          first_candidate_.reset();
++        } else {
++          current_ = translation_->Peek();
++        }
++        translation_->Next();
++        current_is_injected_ = false;
++        if (current_) {
++          break;
++        }
++        continue;
++      }
++
++      if (!insertion_started_ && !injected_.empty()) {
++        if (regular_yielded_ == 0) {
++          if (!rewriter_->options_.fallback_on_empty) {
++            set_exhausted(true);
++            break;
++          }
++          release_all_ = true;
++          front_limit_ = injected_.size();
++        }
++        insertion_started_ = true;
++        if (injected_index_ < front_limit_) {
++          current_ = injected_[injected_index_];
++          current_is_injected_ = true;
++          break;
++        }
++      }
++
++      set_exhausted(true);
++      break;
++    }
++  }
++
++  an<Translation> translation_;
++  const Rewriter* rewriter_;
++  Context* context_;
++  vector<an<Candidate>> injected_;
++  an<Candidate> current_;
++  size_t injected_index_ = 0;
++  size_t front_limit_ = 0;
++  size_t regular_yielded_ = 0;
++  an<Candidate> first_candidate_;
++  bool first_candidate_checked_ = false;
++  bool insertion_started_ = false;
++  bool release_all_ = false;
++  bool current_is_injected_ = false;
++};
++
++Rewriter::Rewriter(const Ticket& ticket) : Filter(ticket), TagMatching(ticket) {
++  if (name_space_.empty() || name_space_ == "filter") {
++    name_space_ = "rewriter";
++  }
++  LoadConfig();
++
++  if (!engine_ || !engine_->schema()) {
++    return;
++  }
++  const path pack_path = ResolvePackPath(engine_->schema()->schema_id());
++  if (pack_path.empty()) {
++    LOG(WARNING) << "rewriter@" << name_space_ << " is disabled: rewrite pack "
++                 << "for schema '" << engine_->schema()->schema_id()
++                 << "' was not found; redeploy the schema to build it.";
++    return;
++  }
++  pack_ = RewritePack::OpenCached(pack_path);
++  if (!pack_) {
++    return;
++  }
++  // Bind once; every subsequent query goes directly to this stage's view.
++  stage_ = pack_->FindSection(name_space_);
++  if (!stage_) {
++    LOG(WARNING) << "rewriter@" << name_space_
++                 << " is disabled: matching section was not found in rewrite "
++                    "pack '"
++                 << pack_path << "'; check engine/filters and rewriter@"
++                 << name_space_ << " configuration, then redeploy.";
++  }
++}
++
++Rewriter::~Rewriter() = default;
++
++void Rewriter::LoadConfig() {
++  if (!engine_ || !engine_->schema() || !engine_->schema()->config()) {
++    return;
++  }
++  Config* config = engine_->schema()->config();
++
++  const auto option_item = config->GetItem(name_space_ + "/option");
++  if (auto value = As<ConfigValue>(option_item)) {
++    if (value->str() == "true") {
++      options_.always_on = true;
++    } else if (!value->str().empty() && value->str() != "false") {
++      options_.option_names.push_back(value->str());
++    }
++  } else if (auto list = As<ConfigList>(option_item)) {
++    for (size_t i = 0; i < list->size(); ++i) {
++      if (auto value = As<ConfigValue>(list->GetAt(i))) {
++        if (!value->str().empty()) {
++          options_.option_names.push_back(value->str());
++        }
++      }
++    }
++  }
++
++  string mode;
++  config->GetString(name_space_ + "/mode", &mode);
++  if (mode == "replace") {
++    options_.mode = Mode::kReplace;
++  } else if (mode == "comment") {
++    options_.mode = Mode::kComment;
++  } else if (mode == "abbrev") {
++    options_.mode = Mode::kAbbrev;
++  } else {
++    options_.mode = Mode::kAppend;
++  }
++
++  config->GetBool(name_space_ + "/sentence", &options_.sentence);
++  config->GetBool(name_space_ + "/fallback_on_empty",
++                  &options_.fallback_on_empty);
++
++  string comment_mode;
++  config->GetString(name_space_ + "/comment_mode", &comment_mode);
++  if (comment_mode == "text") {
++    options_.comment_mode = CommentMode::kText;
++  } else if (comment_mode == "inherit") {
++    options_.comment_mode = CommentMode::kComment;
++  }
++  config->GetString(name_space_ + "/comment_format", &options_.comment_format);
++  config->GetString(name_space_ + "/cand_type", &options_.cand_type);
++  if (options_.cand_type == "preserve") {
++    options_.cand_type.clear();
++  }
++
++  vector<string> excluded;
++  ReadStringList(config, name_space_ + "/excluded_types", &excluded);
++  options_.excluded_types.insert(excluded.begin(), excluded.end());
++
++  vector<string> preferred;
++  ReadStringList(config, name_space_ + "/prefer_types", &preferred);
++  options_.prefer_types.insert(preferred.begin(), preferred.end());
++
++  int value = 0;
++  if (config->GetInt(name_space_ + "/position", &value) && value > 0) {
++    options_.position = static_cast<size_t>(value);
++  }
++  if (config->GetInt(name_space_ + "/count", &value) && value > 0) {
++    options_.count = static_cast<size_t>(value);
++  }
++}
++
++bool Rewriter::Active() const {
++  if (options_.always_on) {
++    return true;
++  }
++  if (!engine_ || !engine_->context()) {
++    return false;
++  }
++  for (const auto& option_name : options_.option_names) {
++    if (engine_->context()->get_option(option_name)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool Rewriter::Rewrite(const string& text, vector<string>* values) const {
++  values->clear();
++  if (!stage_) {
++    return false;
++  }
++  if (options_.sentence) {
++    string rewritten;
++    if (!stage_->ConvertSentence(text, &rewritten)) {
++      return false;
++    }
++    values->push_back(std::move(rewritten));
++    return true;
++  }
++  return stage_->Lookup(text, values);
++}
++
++string Rewriter::CandidateType(const an<Candidate>& candidate) const {
++  return options_.cand_type.empty() ? candidate->type() : options_.cand_type;
++}
++
++string Rewriter::FormatComment(const string& value) const {
++  if (options_.comment_format.empty()) {
++    return value;
++  }
++  string result = options_.comment_format;
++  const size_t pos = result.find("%s");
++  if (pos == string::npos) {
++    return value;
++  }
++  result.replace(pos, 2, value);
++  return result;
++}
++
++string Rewriter::DerivedComment(const an<Candidate>& candidate) const {
++  string comment;
++  switch (options_.comment_mode) {
++    case CommentMode::kText:
++      comment = candidate->text();
++      break;
++    case CommentMode::kComment:
++      comment = candidate->comment();
++      break;
++    case CommentMode::kNone:
++    default:
++      return string();
++  }
++  return comment.empty() ? string() : FormatComment(comment);
++}
++
++bool Rewriter::Transform(const an<Candidate>& candidate,
++                         CandidateQueue* result) const {
++  // Apply() already gates the translation on the current option state. Avoid
++  // querying Context::get_option() again for every candidate in the hot path.
++  if (!candidate || !result || !stage_) {
++    return false;
++  }
++  if (options_.excluded_types.find(candidate->type()) !=
++      options_.excluded_types.end()) {
++    return false;
++  }
++
++  vector<string> values;
++  if (!Rewrite(candidate->text(), &values)) {
++    return false;
++  }
++
++  if (options_.mode == Mode::kComment) {
++    const string annotation = FormatComment(Join(values, " "));
++    string comment = annotation;
++    if (options_.comment_mode == CommentMode::kComment &&
++        !candidate->comment().empty()) {
++      comment = candidate->comment() + " " + annotation;
++    }
++    result->push_back(New<ShadowCandidate>(candidate, candidate->type(),
++                                           candidate->text(), comment, false));
++    return true;
++  }
++
++  const string comment = DerivedComment(candidate);
++  const bool append_mode = options_.mode == Mode::kAppend;
++  if (append_mode) {
++    result->push_back(candidate);
++  }
++
++  const string type = CandidateType(candidate);
++  for (const auto& value : values) {
++    // The compiler deduplicates values for each key. The only duplicate that
++    // matters here is an append result equal to the original candidate.
++    if (value.empty() || (append_mode && value == candidate->text())) {
++      continue;
++    }
++    result->push_back(
++        New<ShadowCandidate>(candidate, type, value, comment, false));
++  }
++
++  if (options_.mode == Mode::kReplace && result->empty()) {
++    result->push_back(candidate);
++  }
++  return true;
++}
++
++an<Translation> Rewriter::Apply(an<Translation> translation,
++                                CandidateList* candidates) {
++  (void)candidates;
++  if (!translation || !stage_ || !Active()) {
++    return translation;
++  }
++  if (options_.mode == Mode::kAbbrev) {
++    return New<RewriterAbbrevTranslation>(translation, this,
++                                          engine_->context());
++  }
++  return New<RewriterTranslation>(translation, this);
++}
++
++}  // namespace rime
+diff --git a/src/rime/gear/rewriter.h b/src/rime/gear/rewriter.h
+new file mode 100644
+index 00000000..25e58ef4
+--- /dev/null
++++ b/src/rime/gear/rewriter.h
+@@ -0,0 +1,78 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#ifndef RIME_REWRITER_H_
++#define RIME_REWRITER_H_
++
++#include <memory>
++#include <set>
++#include <string>
++#include <vector>
++
++#include <rime/filter.h>
++#include <rime/dict/rewrite_pack.h>
++#include <rime/gear/filter_commons.h>
++
++namespace rime {
++
++class RewriterTranslation;
++class RewriterAbbrevTranslation;
++
++class Rewriter : public Filter, public TagMatching {
++ public:
++  explicit Rewriter(const Ticket& ticket);
++  ~Rewriter() override;
++
++  an<Translation> Apply(an<Translation> translation,
++                        CandidateList* candidates) override;
++  bool AppliesToSegment(Segment* segment) override {
++    return TagsMatch(segment);
++  }
++
++ private:
++  friend class RewriterTranslation;
++  friend class RewriterAbbrevTranslation;
++
++  enum class Mode { kAppend, kReplace, kComment, kAbbrev };
++  enum class CommentMode { kNone, kText, kComment };
++
++  struct Options {
++    bool always_on = false;
++    vector<string> option_names;
++    Mode mode = Mode::kAppend;
++    bool sentence = false;
++    bool fallback_on_empty = true;
++    CommentMode comment_mode = CommentMode::kNone;
++    string comment_format = "〔%s〕";
++    string cand_type;
++    set<string> excluded_types;
++    set<string> prefer_types;
++    size_t position = 1;
++    size_t count = 1;
++  };
++
++  void LoadConfig();
++  bool Active() const;
++  bool Rewrite(const string& text, vector<string>* values) const;
++  bool Transform(const an<Candidate>& candidate, CandidateQueue* result) const;
++  string CandidateType(const an<Candidate>& candidate) const;
++  string DerivedComment(const an<Candidate>& candidate) const;
++  string FormatComment(const string& value) const;
++
++  Options options_;
++  // Retain the mapping for stage_, including while a new pack is deployed.
++  std::shared_ptr<const RewritePack> pack_;
++  RewritePack::StageHandle stage_ = nullptr;
++};
++
++class RewriterComponent : public Rewriter::Component {
++ public:
++  Rewriter* Create(const Ticket& ticket) override {
++    return new Rewriter(ticket);
++  }
++};
++
++}  // namespace rime
++
++#endif  // RIME_REWRITER_H_
+diff --git a/src/rime/lever/deployment_tasks.cc b/src/rime/lever/deployment_tasks.cc
+index 6e6ff895..a5668047 100644
+--- a/src/rime/lever/deployment_tasks.cc
++++ b/src/rime/lever/deployment_tasks.cc
+@@ -24,6 +24,7 @@
+ #include <rime/dict/dictionary.h>
+ #include <rime/dict/dict_compiler.h>
+ #include <rime/lever/deployment_tasks.h>
++#include <rime/lever/rewrite_compiler.h>
+ #include <rime/lever/user_dict_manager.h>
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -346,6 +347,18 @@ bool SchemaUpdate::Run(Deployer* deployer) {
+   }
+   // reload compiled config
+   config.reset(Config::Require("schema")->Create(schema_id));
++
++  // Rewrite compilation is additive. Reuse the already loaded config so the
++  // existing dictionary deployment path below remains unchanged.
++  {
++    RewriteCompiler rewrite_compiler(schema_id, config.get(), deployer);
++    if (!rewrite_compiler.Compile()) {
++      LOG(ERROR) << "rewrite pack for schema '" << schema_id
++                 << "' failed to compile.";
++      return false;
++    }
++  }
++
+   string dict_name;
+   if (!config->GetString("translator/dictionary", &dict_name)) {
+     // not requiring a dictionary
+diff --git a/src/rime/lever/rewrite_compiler.cc b/src/rime/lever/rewrite_compiler.cc
+new file mode 100644
+index 00000000..2828e7f2
+--- /dev/null
++++ b/src/rime/lever/rewrite_compiler.cc
+@@ -0,0 +1,583 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++// The deployment compiler deliberately understands only the native files
++// contract. Format adapters (if any) must produce these files before this
++// component is invoked; the compiler itself has no knowledge of their source
++// format.
++#include <rime/lever/rewrite_compiler.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <system_error>
++#include <unordered_set>
++#include <utility>
++
++#include <rime/algo/algebra.h>
++#include <rime/algo/utilities.h>
++#include <rime/config.h>
++#include <rime/deployer.h>
++#include <rime/dict/rewrite_pack.h>
++
++namespace rime {
++
++namespace {
++
++namespace fs = std::filesystem;
++constexpr size_t kMaxSourceLineBytes = 16 * 1024 * 1024;
++constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
++constexpr uint64_t kFnvPrime = 1099511628211ULL;
++constexpr uint64_t kSourceChecksumContractVersion = 2;
++
++uint64_t HashBytes(uint64_t hash, const char* data, size_t size) {
++  for (size_t i = 0; i < size; ++i) {
++    hash ^= static_cast<unsigned char>(data[i]);
++    hash *= kFnvPrime;
++  }
++  return hash;
++}
++
++uint64_t HashU64(uint64_t hash, uint64_t value) {
++  char bytes[8];
++  for (size_t i = 0; i < sizeof(bytes); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  return HashBytes(hash, bytes, sizeof(bytes));
++}
++
++uint64_t HashString(uint64_t hash, const string& value) {
++  hash = HashU64(hash, value.size());
++  return HashBytes(hash, value.data(), value.size());
++}
++
++bool StartsWith(const string& text, const string& prefix) {
++  return text.size() >= prefix.size() &&
++         std::equal(prefix.begin(), prefix.end(), text.begin());
++}
++
++bool PrepareSourceLine(string* line) {
++  if (!line) {
++    return false;
++  }
++  if (!line->empty() && line->back() == '\r') {
++    line->pop_back();
++  }
++  if (line->size() >= 3 && static_cast<unsigned char>((*line)[0]) == 0xef &&
++      static_cast<unsigned char>((*line)[1]) == 0xbb &&
++      static_cast<unsigned char>((*line)[2]) == 0xbf) {
++    line->erase(0, 3);
++  }
++
++  const size_t first = line->find_first_not_of(" \t");
++  return first != string::npos && (*line)[first] != '#';
++}
++
++string DecodeEscapes(const string& text) {
++  string result;
++  result.reserve(text.size());
++  for (size_t i = 0; i < text.size(); ++i) {
++    if (text[i] != '\\' || i + 1 >= text.size()) {
++      result.push_back(text[i]);
++      continue;
++    }
++    switch (text[++i]) {
++      case 'n':
++        result.push_back('\n');
++        break;
++      case 't':
++        result.push_back('\t');
++        break;
++      case 'r':
++        result.push_back('\r');
++        break;
++      case '\\':
++        result.push_back('\\');
++        break;
++      default:
++        // Unknown escapes are kept losslessly instead of silently changing
++        // user data.
++        result.push_back('\\');
++        result.push_back(text[i]);
++        break;
++    }
++  }
++  return result;
++}
++
++bool ParseFileLine(const string& source, string* key, vector<string>* values) {
++  if (!key || !values) {
++    return false;
++  }
++
++  const size_t tab = source.find('\t');
++  if (tab == string::npos || tab == 0 || tab + 1 >= source.size()) {
++    return false;
++  }
++
++  *key = DecodeEscapes(source.substr(0, tab));
++  const string value = DecodeEscapes(source.substr(tab + 1));
++  values->clear();
++  if (key->empty() || value.empty()) {
++    return false;
++  }
++  values->push_back(value);
++  return true;
++}
++
++bool IsWithin(const path& root, const path& candidate) {
++  auto root_it = root.begin();
++  auto candidate_it = candidate.begin();
++  for (; root_it != root.end() && candidate_it != candidate.end();
++       ++root_it, ++candidate_it) {
++    if (*root_it != *candidate_it) {
++      return false;
++    }
++  }
++  return root_it == root.end();
++}
++
++path ResolveUnderRoot(const path& root, const path& relative) {
++  if (root.empty()) {
++    return path();
++  }
++  std::error_code ec;
++  const path canonical_root = fs::weakly_canonical(root, ec);
++  if (ec || !fs::is_directory(canonical_root, ec) || ec) {
++    return path();
++  }
++
++  const path candidate = canonical_root / relative;
++  const path canonical_candidate = fs::canonical(candidate, ec);
++  if (ec || !fs::is_regular_file(canonical_candidate, ec) || ec ||
++      !IsWithin(canonical_root, canonical_candidate)) {
++    return path();
++  }
++  return canonical_candidate;
++}
++
++path ResolveDataFile(Deployer* deployer,
++                     const string& section_name,
++                     const string& file_name) {
++  if (!deployer || file_name.empty()) {
++    return path();
++  }
++
++  const path requested(file_name);
++  // Source files are data resources, not arbitrary paths. Reject absolute
++  // paths and parent traversal so a schema cannot make deployment read a
++  // file outside the configured data roots. Symlink escapes are rejected by
++  // ResolveUnderRoot as well.
++  if (requested.is_absolute() || requested.has_root_name() ||
++      requested.has_root_directory()) {
++    LOG(ERROR)
++        << "rewriter@" << section_name << "/files contains absolute path '"
++        << file_name
++        << "'; use a path relative to Rime's user/shared data directory.";
++    return path();
++  }
++  // Inspect the spelling supplied by the schema before normalizing it. A
++  // path such as "a/../b" happens to remain under the root, but accepting
++  // parent components makes the boundary harder to audit and broadens the
++  // file contract unnecessarily.
++  for (const auto& component : requested) {
++    if (component == "..") {
++      LOG(ERROR) << "rewriter@" << section_name
++                 << "/files contains unsafe path '" << file_name
++                 << "'; '..' components are not allowed.";
++      return path();
++    }
++  }
++  const path relative = requested.lexically_normal();
++
++  path resolved = ResolveUnderRoot(deployer->user_data_dir, relative);
++  if (!resolved.empty()) {
++    return resolved;
++  }
++  resolved = ResolveUnderRoot(deployer->shared_data_dir, relative);
++  if (!resolved.empty()) {
++    return resolved;
++  }
++  LOG(ERROR) << "rewriter@" << section_name << " source '" << file_name
++             << "' was not found as a regular file inside Rime data "
++                "directories; searched user='"
++             << deployer->user_data_dir << "', shared='"
++             << deployer->shared_data_dir << "'. Check rewriter@"
++             << section_name
++             << "/files and the file path; symlinks must remain inside these "
++                "directories.";
++  return path();
++}
++
++void ReadStringList(Config* config, const string& key, vector<string>* values);
++
++struct RewriteSourceFile {
++  string declared_name;
++  path resolved_path;
++};
++
++struct RewriteSourceSection {
++  string name;
++  string key_projection;
++  vector<RewriteSourceFile> files;
++};
++
++bool ResolveRewriteSources(Config* config,
++                           Deployer* deployer,
++                           const vector<string>& section_names,
++                           vector<RewriteSourceSection>* sources) {
++  if (!config || !deployer || !sources) {
++    return false;
++  }
++
++  sources->clear();
++  sources->reserve(section_names.size());
++  for (const auto& section_name : section_names) {
++    vector<string> files;
++    ReadStringList(config, section_name + "/files", &files);
++    if (files.empty()) {
++      LOG(ERROR) << "rewriter@" << section_name
++                 << "/files is missing or empty; add at least one relative "
++                    "rewrite source path.";
++      return false;
++    }
++
++    RewriteSourceSection section;
++    section.name = section_name;
++    config->GetString(section_name + "/key_projection",
++                      &section.key_projection);
++    section.files.reserve(files.size());
++    for (const auto& file_name : files) {
++      const path file_path = ResolveDataFile(deployer, section_name, file_name);
++      if (file_path.empty()) {
++        return false;
++      }
++      section.files.push_back({file_name, file_path});
++    }
++    sources->push_back(std::move(section));
++  }
++  return true;
++}
++
++bool ComputeSourceChecksum(const vector<RewriteSourceSection>& sources,
++                           uint64_t* checksum) {
++  if (!checksum) {
++    return false;
++  }
++
++  uint64_t hash = kFnvOffsetBasis;
++  hash = HashU64(hash, kSourceChecksumContractVersion);
++  hash = HashU64(hash, sources.size());
++  for (const auto& section : sources) {
++    hash = HashString(hash, section.name);
++    hash = HashString(hash, section.key_projection);
++    // One section currently equals one pipeline stage.
++    hash = HashU64(hash, 1);
++    hash = HashU64(hash, section.files.size());
++    for (const auto& file : section.files) {
++      std::error_code ec;
++      const uint64_t file_size = fs::file_size(file.resolved_path, ec);
++      if (ec) {
++        LOG(ERROR) << "rewriter@" << section.name
++                   << " cannot read metadata for source '" << file.resolved_path
++                   << "': " << ec.message()
++                   << "; check that the file still exists and is readable.";
++        return false;
++      }
++
++      // Reuse librime's streaming CRC32 implementation for source bytes. The
++      // outer FNV framing adds section names, file names, lengths and ordering,
++      // so A+BC cannot alias AB+C merely because the concatenated bytes match.
++      ChecksumComputer cc;
++      cc.ProcessFile(file.resolved_path);
++      const uint32_t file_checksum = cc.Checksum();
++
++      hash = HashString(hash, file.declared_name);
++      hash = HashU64(hash, file_size);
++      hash = HashU64(hash, file_checksum);
++    }
++  }
++
++  *checksum = hash;
++  return true;
++}
++
++bool BuildKeyProjection(const string& section_name,
++                        const string& key_projection,
++                        Projection* projection) {
++  if (!projection || key_projection.empty()) {
++    return false;
++  }
++
++  const size_t separator = key_projection.find('>');
++  if (separator == string::npos || separator == 0 ||
++      separator + 1 >= key_projection.size() ||
++      key_projection.find('>', separator + 1) != string::npos) {
++    LOG(ERROR) << "rewriter@" << section_name << "/key_projection='"
++               << key_projection
++               << "' is invalid; expected exactly one non-empty 'from>to' "
++                  "mapping, for example 'jys>597'.";
++    return false;
++  }
++
++  const string from = key_projection.substr(0, separator);
++  const string to = key_projection.substr(separator + 1);
++  const string formula = "xlit/" + from + "/" + to + "/";
++  auto rules = New<ConfigList>();
++  rules->Append(New<ConfigValue>(formula));
++  if (!projection->Load(rules)) {
++    LOG(ERROR) << "rewriter@" << section_name << "/key_projection='"
++               << key_projection
++               << "' could not be compiled as xlit; verify that both sides "
++                  "form a valid transliteration mapping.";
++    return false;
++  }
++  return true;
++}
++
++bool LoadSourceFile(const string& section_name,
++                    const path& file_path,
++                    Projection* projection,
++                    RewriteStageData* stage) {
++  if (!stage) {
++    return false;
++  }
++
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    LOG(ERROR) << "rewriter@" << section_name << " cannot open source '"
++               << file_path << "'; check that the file exists and is readable.";
++    return false;
++  }
++
++  string line;
++  size_t line_number = 0;
++  while (std::getline(in, line)) {
++    ++line_number;
++    if (line.size() > kMaxSourceLineBytes) {
++      LOG(ERROR) << "rewriter@" << section_name << " source " << file_path
++                 << ':' << line_number
++                 << " exceeds the 16 MiB per-line limit; split or shorten "
++                    "this entry.";
++      return false;
++    }
++    if (!PrepareSourceLine(&line)) {
++      continue;
++    }
++
++    string key;
++    vector<string> values;
++    if (!ParseFileLine(line, &key, &values)) {
++      LOG(ERROR) << "rewriter@" << section_name << " source " << file_path
++                 << ':' << line_number
++                 << " is malformed; expected non-empty key<TAB>value.";
++      return false;
++    }
++
++    string preedit;
++    if (projection) {
++      const string source_key = key;
++      projection->Apply(&key);
++      if (key.empty()) {
++        LOG(ERROR) << "rewriter@" << section_name
++                   << "/key_projection converted source key '" << source_key
++                   << "' to an empty key at " << file_path << ':' << line_number
++                   << "; adjust key_projection so every source key remains "
++                      "non-empty.";
++        return false;
++      }
++      if (key != source_key) {
++        preedit = source_key;
++      }
++    }
++
++    for (const auto& value : values) {
++      stage->entries.push_back({key, value, preedit});
++    }
++  }
++
++  if (in.bad()) {
++    LOG(ERROR) << "rewriter@" << section_name
++               << " encountered an I/O error while reading source '"
++               << file_path << "'; check file permissions and storage health.";
++    return false;
++  }
++  return true;
++}
++
++void ReadStringList(Config* config, const string& key, vector<string>* values) {
++  values->clear();
++  const auto item = config->GetItem(key);
++  if (auto value = As<ConfigValue>(item)) {
++    if (!value->str().empty()) {
++      values->push_back(value->str());
++    }
++    return;
++  }
++  if (auto list = As<ConfigList>(item)) {
++    for (size_t i = 0; i < list->size(); ++i) {
++      if (auto value = As<ConfigValue>(list->GetAt(i))) {
++        if (!value->str().empty()) {
++          values->push_back(value->str());
++        }
++      }
++    }
++  }
++}
++
++vector<string> FindRewriterSections(Config* config) {
++  vector<string> result;
++  std::unordered_set<string> seen;
++  auto filters = config->GetList("engine/filters");
++  if (!filters) {
++    return result;
++  }
++
++  for (auto it = filters->begin(); it != filters->end(); ++it) {
++    auto value = As<ConfigValue>(*it);
++    if (!value) {
++      continue;
++    }
++
++    const string& component = value->str();
++    string section;
++    if (component == "rewriter") {
++      section = "rewriter";
++    } else if (StartsWith(component, "rewriter@")) {
++      section = component.substr(sizeof("rewriter@") - 1);
++    } else {
++      continue;
++    }
++
++    if (!section.empty() && seen.insert(section).second) {
++      result.push_back(std::move(section));
++    }
++  }
++  return result;
++}
++
++bool CompileSection(const RewriteSourceSection& source,
++                    RewriteSectionData* output) {
++  if (!output) {
++    return false;
++  }
++
++  output->name = source.name;
++  output->stage.entries.clear();
++
++  Projection projection;
++  Projection* active_projection = nullptr;
++  if (!source.key_projection.empty()) {
++    if (!BuildKeyProjection(source.name, source.key_projection, &projection)) {
++      return false;
++    }
++    active_projection = &projection;
++  }
++
++  // One rewriter section is one pipeline stage. All files listed here are
++  // merged into this single stage/trie in the declared order.
++  std::unordered_set<string> seen_files;
++  seen_files.reserve(source.files.size());
++  for (const auto& file : source.files) {
++    const string& file_name = file.declared_name;
++    const path& file_path = file.resolved_path;
++    const string identity = file_path.generic_string();
++    if (!seen_files.insert(identity).second) {
++      LOG(WARNING) << "rewriter@" << source.name << " lists source '"
++                   << file_name
++                   << "' more than once; later duplicate is ignored.";
++      continue;
++    }
++    if (!LoadSourceFile(source.name, file_path, active_projection,
++                        &output->stage)) {
++      return false;
++    }
++  }
++
++  if (output->stage.entries.empty()) {
++    LOG(ERROR) << "rewriter@" << source.name
++               << " produced no usable entries; check its files for "
++                  "non-empty key<TAB>value lines.";
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++RewriteCompiler::RewriteCompiler(const string& schema_id,
++                                 Config* config,
++                                 Deployer* deployer)
++    : schema_id_(schema_id), config_(config), deployer_(deployer) {}
++
++bool RewriteCompiler::Compile() {
++  if (!config_ || !deployer_) {
++    return false;
++  }
++
++  const path schema_id_path(schema_id_);
++  if (schema_id_.empty() || schema_id_path.is_absolute() ||
++      schema_id_path.has_parent_path() ||
++      schema_id_path.filename().string() != schema_id_) {
++    LOG(ERROR) << "cannot build rewrite pack: schema id '" << schema_id_
++               << "' is invalid; expected a single non-empty schema id "
++                  "without path components.";
++    return false;
++  }
++  const vector<string> section_names = FindRewriterSections(config_);
++  const path output_path = deployer_->staging_dir / (schema_id_ + ".rwp");
++
++  if (section_names.empty()) {
++    // No rewriter means no deployment side effect. A stale pack is inert
++    // because no Rewriter component will be constructed for this schema.
++    return true;
++  }
++
++  vector<RewriteSourceSection> sources;
++  if (!ResolveRewriteSources(config_, deployer_, section_names, &sources)) {
++    return false;
++  }
++
++  uint64_t source_checksum = 0;
++  if (!ComputeSourceChecksum(sources, &source_checksum)) {
++    return false;
++  }
++  if (RewritePackBuilder::IsUpToDate(output_path, source_checksum)) {
++    LOG(INFO) << "rewrite pack is up-to-date: " << output_path;
++    return true;
++  }
++
++  vector<RewriteSectionData> sections;
++  sections.reserve(sources.size());
++  for (const auto& source : sources) {
++    RewriteSectionData section;
++    if (!CompileSection(source, &section)) {
++      return false;
++    }
++    sections.push_back(std::move(section));
++  }
++
++  std::error_code ec;
++  fs::create_directories(deployer_->staging_dir, ec);
++  if (ec) {
++    LOG(ERROR) << "cannot create rewrite pack staging directory '"
++               << deployer_->staging_dir << "': " << ec.message()
++               << "; check directory permissions and available storage.";
++    return false;
++  }
++
++  LOG(INFO) << "compiling rewrite pack '" << output_path << "'.";
++  RewritePackBuilder builder;
++  if (!builder.Build(output_path, sections, source_checksum)) {
++    LOG(ERROR) << "rewrite pack build failed for '" << output_path
++               << "'; see the preceding rewrite error for the root cause.";
++    return false;
++  }
++  LOG(INFO) << "rewrite pack is ready: " << output_path;
++  return true;
++}
++
++}  // namespace rime
+diff --git a/src/rime/lever/rewrite_compiler.h b/src/rime/lever/rewrite_compiler.h
+new file mode 100644
+index 00000000..6e4ff177
+--- /dev/null
++++ b/src/rime/lever/rewrite_compiler.h
+@@ -0,0 +1,32 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#ifndef RIME_REWRITE_COMPILER_H_
++#define RIME_REWRITE_COMPILER_H_
++
++#include <rime_api.h>
++#include <rime/common.h>
++
++namespace rime {
++
++class Config;
++class Deployer;
++
++class RIME_DLL RewriteCompiler {
++ public:
++  // Compiles only the native section/files contract. External data importers
++  // are intentionally outside this class.
++  RewriteCompiler(const string& schema_id, Config* config, Deployer* deployer);
++
++  bool Compile();
++
++ private:
++  string schema_id_;
++  Config* config_;
++  Deployer* deployer_;
++};
++
++}  // namespace rime
++
++#endif  // RIME_REWRITE_COMPILER_H_

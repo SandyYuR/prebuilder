@@ -58,7 +58,12 @@ librimeRule = do
             -- listener made later listeners delete a second, unrelated word
             -- ("forget one word, lose two"). Defer the rebuild to the end of the
             -- dispatch instead.
-            cmd_ (Cwd src) "git apply ../patches/librime-defer-composition-refresh-on-delete.patch",
+            cmd_ (Cwd src) "git apply ../patches/librime-defer-composition-refresh-on-delete.patch"
+            -- PR #1232 "rewrite" filter (rewriter / rewrite_compiler /
+            -- rewrite_pack). Additive: Compile() returns early when the schema
+            -- declares no rewriter section, so existing schemas are unaffected.
+            -- Authored against upstream 74bd5dc4, which is the pinned submodule.
+            cmd_ (Cwd src) "git apply ../patches/librime-pr1232-rewrite-filter.patch",
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",
