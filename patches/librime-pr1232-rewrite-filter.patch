@@ -1,9 +1,9 @@
 diff --git a/src/rime/dict/rewrite_pack.cc b/src/rime/dict/rewrite_pack.cc
 new file mode 100644
-index 0000000..81ed0af
+index 0000000..c98ac22
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.cc
-@@ -0,0 +1,1592 @@
+@@ -0,0 +1,1502 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -24,18 +24,25 @@ index 0000000..81ed0af
 +#include <filesystem>
 +#include <fstream>
 +#include <functional>
++#include <map>
 +#include <limits>
 +#include <mutex>
++#include <sstream>
 +#include <string_view>
 +#include <system_error>
 +#include <thread>
 +#include <unordered_map>
 +#include <unordered_set>
 +#include <utility>
++#include <vector>
++#include <boost/interprocess/file_mapping.hpp>
++#include <boost/interprocess/mapped_region.hpp>
 +#include <darts.h>
-+#include <rime/dict/mapped_file.h>
 +#ifdef _WIN32
 +#include <windows.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
 +#endif
 +
 +namespace rime {
@@ -50,7 +57,6 @@ index 0000000..81ed0af
 +constexpr uint32_t kStageFlagHasPreedit = 1U << 0;
 +constexpr uint32_t kKnownStageFlags = kStageFlagHasPreedit;
 +constexpr uint64_t kBuildIdRevision = 1;
-+constexpr size_t kInvalidIndex = std::numeric_limits<size_t>::max();
 +
 +constexpr uint32_t kUnicodeScalarLimit = 0x110000;
 +constexpr uint32_t kCharPageShift = 8;
@@ -59,6 +65,7 @@ index 0000000..81ed0af
 +constexpr uint32_t kCharDirectoryEntries = kUnicodeScalarLimit / kCharPageSize;
 +constexpr uint32_t kDispatchPhraseStarter = 1U << 31;
 +constexpr uint32_t kDispatchKeyMask = kDispatchPhraseStarter - 1;
++constexpr size_t kInvalidIndex = std::numeric_limits<size_t>::max();
 +
 +static_assert(kCharDirectoryEntries <= std::numeric_limits<uint16_t>::max(),
 +              "character dispatch directory must fit uint16_t page ids");
@@ -478,44 +485,101 @@ index 0000000..81ed0af
 +  return hash;
 +}
 +
-+bool ReadPackBuildId(const path& file_path, uint64_t* build_id) {
-+  if (!build_id) {
-+    return false;
-+  }
-+
-+  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
-+                   std::ios::binary);
-+  if (!in) {
-+    return false;
-+  }
-+
-+  std::array<char, kHeaderSize> header{};
-+  in.read(header.data(), header.size());
-+  if (in.gcount() != static_cast<std::streamsize>(header.size()) ||
-+      std::memcmp(header.data(), kMagic, sizeof(kMagic)) != 0 ||
-+      ReadU32(header.data() + 8) != kFormatVersion) {
-+    return false;
-+  }
-+
-+  std::error_code ec;
-+  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
-+  const uint32_t section_count = ReadU32(header.data() + 12);
-+  const uint64_t section_table_offset = ReadU64(header.data() + 16);
-+  if (ec || ReadU64(header.data() + 40) != actual_size ||
-+      !ValidateSectionTable(section_count, section_table_offset, actual_size)) {
-+    return false;
-+  }
-+
-+  *build_id = ReadU64(header.data() + 24);
-+  return true;
-+}
-+
-+class RewriteMappedFile : public MappedFile {
++class RewriteStageStorage {
 + public:
-+  explicit RewriteMappedFile(const path& file_path) : MappedFile(file_path) {}
++  RewriteStageStorage() = default;
++  ~RewriteStageStorage() { Close(); }
 +
-+  bool Open() { return OpenReadOnly(); }
-+  const char* data() const { return address(); }
++  bool Open(const path& file_path, uint64_t offset, uint64_t size) {
++    Close();
++    if (size == 0 || size > std::numeric_limits<size_t>::max()) {
++      return false;
++    }
++#ifdef _WIN32
++    HANDLE file =
++        CreateFileW(file_path.wstring().c_str(), GENERIC_READ,
++                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE) {
++      return false;
++    }
++    SYSTEM_INFO system_info{};
++    GetSystemInfo(&system_info);
++    const uint64_t granularity = system_info.dwAllocationGranularity;
++    const uint64_t aligned_offset = offset / granularity * granularity;
++    const uint64_t delta = offset - aligned_offset;
++    if (delta > std::numeric_limits<size_t>::max() ||
++        size > std::numeric_limits<size_t>::max() - delta) {
++      CloseHandle(file);
++      return false;
++    }
++    const size_t mapping_size = static_cast<size_t>(delta + size);
++    HANDLE mapping =
++        CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
++    if (!mapping) {
++      CloseHandle(file);
++      return false;
++    }
++    void* base = MapViewOfFile(
++        mapping, FILE_MAP_READ, static_cast<DWORD>(aligned_offset >> 32),
++        static_cast<DWORD>(aligned_offset & 0xffffffff), mapping_size);
++    CloseHandle(mapping);
++    CloseHandle(file);
++    if (!base) {
++      return false;
++    }
++    mapped_base_ = base;
++    mapped_size_ = mapping_size;
++    data_ = static_cast<const char*>(base) + delta;
++    return true;
++#else
++    try {
++      mapping_ = std::make_unique<boost::interprocess::file_mapping>(
++          file_path.c_str(), boost::interprocess::read_only);
++      region_ = std::make_unique<boost::interprocess::mapped_region>(
++          *mapping_, boost::interprocess::read_only,
++          static_cast<boost::interprocess::offset_t>(offset),
++          static_cast<size_t>(size));
++      return region_ && region_->get_address() && region_->get_size() == size;
++    } catch (const std::exception&) {
++      mapping_.reset();
++      region_.reset();
++      return false;
++    }
++#endif
++  }
++
++  const char* data() const {
++#ifdef _WIN32
++    return data_;
++#else
++    return region_ ? static_cast<const char*>(region_->get_address()) : nullptr;
++#endif
++  }
++
++ private:
++  void Close() {
++#ifdef _WIN32
++    if (mapped_base_) {
++      UnmapViewOfFile(mapped_base_);
++    }
++    mapped_base_ = nullptr;
++    mapped_size_ = 0;
++    data_ = nullptr;
++#else
++    region_.reset();
++    mapping_.reset();
++#endif
++  }
++
++#ifdef _WIN32
++  void* mapped_base_ = nullptr;
++  size_t mapped_size_ = 0;
++  const char* data_ = nullptr;
++#else
++  std::unique_ptr<boost::interprocess::file_mapping> mapping_;
++  std::unique_ptr<boost::interprocess::mapped_region> region_;
++#endif
 +};
 +
 +struct StageView {
@@ -920,89 +984,56 @@ index 0000000..81ed0af
 +
 +class RewritePack::Impl {
 + public:
-+  std::unique_ptr<RewriteMappedFile> file;
++  std::unique_ptr<RewriteStageStorage> storage;
 +  std::unordered_map<std::string_view, std::unique_ptr<RewriteSection>>
 +      sections;
 +};
 +
-+RewritePack::RewritePack(const path& file_path)
-+    : file_path_(file_path), impl_(new Impl) {}
++RewritePack::RewritePack(const path& file_path, uint64_t offset, uint64_t size)
++    : file_path_(file_path), offset_(offset), size_(size), impl_(new Impl) {}
 +
 +RewritePack::~RewritePack() = default;
 +
 +bool RewritePack::Open() {
-+  impl_->file = std::make_unique<RewriteMappedFile>(file_path_);
-+  if (!impl_->file->Open()) {
-+    LOG(ERROR) << "cannot open rewrite pack '" << file_path_
-+               << "'; the file is missing, unreadable, or cannot be memory "
-+                  "mapped. Redeploy the schema to rebuild it.";
++  impl_->storage = std::make_unique<RewriteStageStorage>();
++  if (!impl_->storage->Open(file_path_, offset_, size_)) {
++    LOG(ERROR) << "cannot open rewrite stage from '" << file_path_ << "'.";
 +    return false;
 +  }
 +
-+  const char* base = impl_->file->data();
-+  const uint64_t file_size = impl_->file->file_size();
-+  if (!base || file_size < kHeaderSize) {
-+    LOG(ERROR) << "rewrite pack '" << file_path_
-+               << "' is truncated or has no valid RWP header; redeploy the "
-+                  "schema to rebuild this generated file.";
-+    return false;
-+  }
-+  if (std::memcmp(base, kMagic, sizeof(kMagic)) != 0) {
-+    if (std::memcmp(base, kMagic, sizeof(kMagic) - 1) == 0) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_ << "' uses incompatible "
-+                 << "format marker '" << std::string_view(base, sizeof(kMagic))
-+                 << "' (expected '" << std::string_view(kMagic, sizeof(kMagic))
-+                 << "'); redeploy the schema to rebuild the pack.";
-+    } else {
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' has an invalid RWP header; redeploy the schema to "
-+                    "rebuild this generated file.";
-+    }
-+    return false;
-+  }
-+
-+  const uint32_t version = ReadU32(base + 8);
-+  if (version != kFormatVersion) {
-+    LOG(ERROR) << "rewrite pack '" << file_path_ << "' uses format version "
-+               << version << ", but this build expects version "
-+               << kFormatVersion
-+               << "; redeploy the schema to rebuild the pack.";
++  const char* base = impl_->storage->data();
++  const uint64_t file_size = size_;
++  if (!base || file_size < kHeaderSize ||
++      std::memcmp(base, kMagic, sizeof(kMagic)) != 0 ||
++      ReadU32(base + 8) != kFormatVersion) {
++    LOG(ERROR) << "rewrite stage in '" << file_path_
++               << "' has an invalid RWP payload.";
 +    return false;
 +  }
 +
 +  const uint32_t section_count = ReadU32(base + 12);
 +  const uint64_t section_table_offset = ReadU64(base + 16);
 +  build_id_ = ReadU64(base + 24);
-+  const uint64_t source_checksum = ReadU64(base + 32);
-+  (void)source_checksum;
 +  const uint64_t declared_file_size = ReadU64(base + 40);
 +  if (declared_file_size != file_size ||
 +      !ValidateSectionTable(section_count, section_table_offset, file_size)) {
-+    LOG(ERROR) << "rewrite pack '" << file_path_
-+               << "' has a corrupted section directory; redeploy the schema "
-+                  "to rebuild the pack.";
++    LOG(ERROR) << "rewrite stage in '" << file_path_
++               << "' has a corrupted section directory.";
 +    return false;
 +  }
 +
 +  impl_->sections.clear();
 +  impl_->sections.reserve(section_count);
-+
 +  for (uint32_t i = 0; i < section_count; ++i) {
 +    const char* p = base + section_table_offset + i * kSectionRecordSize;
 +    const SectionRecord section_record = ReadSectionRecord(p);
 +    if (!ValidateSectionRecord(section_record, file_size)) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' contains an invalid section entry; redeploy the schema "
-+                    "to rebuild the pack.";
 +      return false;
 +    }
 +
 +    const std::string_view name(base + section_record.name_offset,
 +                                section_record.name_size);
 +    if (impl_->sections.find(name) != impl_->sections.end()) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_
-+                 << "' contains duplicate section '" << name
-+                 << "'; redeploy the schema to rebuild the pack.";
 +      return false;
 +    }
 +
@@ -1011,9 +1042,6 @@ index 0000000..81ed0af
 +    const StageRecord stage_record = ReadStageRecord(sp);
 +    const bool has_phrase_trie = stage_record.phrase_key_count != 0;
 +    if (!ValidateStageRecord(stage_record, file_size)) {
-+      LOG(ERROR) << "rewrite pack '" << file_path_ << "' has corrupted "
-+                 << "stage metadata in section '" << name
-+                 << "'; redeploy the schema to rebuild the pack.";
 +      return false;
 +    }
 +
@@ -1034,60 +1062,17 @@ index 0000000..81ed0af
 +      const char* phrase_trie = base + stage_record.phrase_trie_offset;
 +      if (!ValidatePhraseTrieBounds(phrase_trie,
 +                                    stage_record.phrase_trie_size)) {
-+        LOG(ERROR) << "rewrite pack '" << file_path_
-+                   << "' contains a malformed phrase trie in section '" << name
-+                   << "'; redeploy the schema to rebuild the pack.";
++        LOG(ERROR) << "rewrite stage in '" << file_path_
++                   << "' contains a malformed phrase trie.";
 +        return false;
 +      }
 +      stage.phrase_trie.set_array(
 +          phrase_trie, static_cast<size_t>(stage_record.phrase_trie_size /
 +                                           stage.phrase_trie.unit_size()));
 +    }
-+
 +    impl_->sections.emplace(name, std::move(section));
 +  }
 +  return true;
-+}
-+
-+std::shared_ptr<RewritePack> RewritePack::OpenCached(const path& file_path) {
-+  static std::mutex mutex;
-+  static std::unordered_map<string, std::weak_ptr<RewritePack>> cache;
-+
-+  const string cache_key = file_path.u8string();
-+  uint64_t on_disk_build_id = 0;
-+  const bool has_build_id = ReadPackBuildId(file_path, &on_disk_build_id);
-+
-+  {
-+    std::lock_guard<std::mutex> lock(mutex);
-+    auto found = cache.find(cache_key);
-+    if (found != cache.end()) {
-+      if (auto cached = found->second.lock()) {
-+        if (has_build_id && cached->build_id() == on_disk_build_id) {
-+          return cached;
-+        }
-+      }
-+      cache.erase(found);
-+    }
-+  }
-+
-+  auto pack = std::shared_ptr<RewritePack>(new RewritePack(file_path));
-+  if (!pack->Open()) {
-+    return nullptr;
-+  }
-+
-+  {
-+    std::lock_guard<std::mutex> lock(mutex);
-+    auto found = cache.find(cache_key);
-+    if (found != cache.end()) {
-+      if (auto cached = found->second.lock()) {
-+        if (cached->build_id() == pack->build_id()) {
-+          return cached;
-+        }
-+      }
-+    }
-+    cache[cache_key] = pack;
-+  }
-+  return pack;
 +}
 +
 +RewritePack::StageHandle RewritePack::FindSection(const string& name) const {
@@ -1514,81 +1499,6 @@ index 0000000..81ed0af
 +
 +}  // namespace
 +
-+bool RewritePackBuilder::IsUpToDate(const path& file_path,
-+                                    uint64_t source_checksum) {
-+  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
-+                   std::ios::binary);
-+  if (!in) {
-+    return false;
-+  }
-+
-+  std::array<char, kHeaderSize> header{};
-+  in.read(header.data(), header.size());
-+  if (in.gcount() != static_cast<std::streamsize>(header.size()) ||
-+      std::memcmp(header.data(), kMagic, sizeof(kMagic)) != 0 ||
-+      ReadU32(header.data() + 8) != kFormatVersion ||
-+      ReadU64(header.data() + 32) != source_checksum) {
-+    return false;
-+  }
-+
-+  std::error_code ec;
-+  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
-+  if (ec || actual_size < kHeaderSize ||
-+      ReadU64(header.data() + 40) != actual_size) {
-+    return false;
-+  }
-+
-+  const uint32_t section_count = ReadU32(header.data() + 12);
-+  const uint64_t section_table_offset = ReadU64(header.data() + 16);
-+  if (!ValidateSectionTable(section_count, section_table_offset, actual_size)) {
-+    return false;
-+  }
-+
-+  std::unordered_set<string> section_names;
-+  section_names.reserve(section_count);
-+  for (uint32_t i = 0; i < section_count; ++i) {
-+    std::array<char, kSectionRecordSize> section_bytes{};
-+    in.seekg(static_cast<std::streamoff>(
-+        section_table_offset + static_cast<uint64_t>(i) * kSectionRecordSize));
-+    in.read(section_bytes.data(), section_bytes.size());
-+    if (!in) {
-+      return false;
-+    }
-+
-+    const SectionRecord section_record =
-+        ReadSectionRecord(section_bytes.data());
-+    if (!ValidateSectionRecord(section_record, actual_size)) {
-+      return false;
-+    }
-+
-+    string name(section_record.name_size, '\0');
-+    in.seekg(static_cast<std::streamoff>(section_record.name_offset));
-+    in.read(name.data(), static_cast<std::streamsize>(name.size()));
-+    if (!in || !section_names.insert(name).second) {
-+      return false;
-+    }
-+
-+    std::array<char, kStageRecordSize> stage_bytes{};
-+    in.seekg(static_cast<std::streamoff>(section_record.stage_table_offset));
-+    in.read(stage_bytes.data(), stage_bytes.size());
-+    if (!in) {
-+      return false;
-+    }
-+
-+    const StageRecord stage_record = ReadStageRecord(stage_bytes.data());
-+    if (!ValidateStageRecord(stage_record, actual_size)) {
-+      return false;
-+    }
-+  }
-+  return true;
-+}
-+
-+bool RewritePackBuilder::Build(const path& output_path,
-+                               const vector<RewriteSectionData>& sections,
-+                               uint64_t source_checksum) const {
-+  return BuildRewritePackInternal(output_path, sections, source_checksum);
-+}
-+
 +bool RewritePackBuilder::Build(
 +    const path& output_path,
 +    const vector<RewriteSectionData>& sections) const {
@@ -1598,10 +1508,10 @@ index 0000000..81ed0af
 +}  // namespace rime
 diff --git a/src/rime/dict/rewrite_pack.h b/src/rime/dict/rewrite_pack.h
 new file mode 100644
-index 0000000..868e409
+index 0000000..3b95ce9
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,97 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -1644,29 +1554,30 @@ index 0000000..868e409
 +};
 +
 +class RewriteSection;
++class RewriteStore;
 +
 +class RIME_DLL RewritePack {
 + public:
 +  // Non-owning, read-only stage pointer. Keep this pack alive while using it.
-+  // Resolve once at filter initialization; queries do not revisit the index.
++  // Resolve once when a filter first becomes active; queries do not revisit
++  // the store index.
 +  using StageHandle = const RewriteSection*;
 +
 +  ~RewritePack();
 +
-+  static std::shared_ptr<RewritePack> OpenCached(const path& file_path);
-+
 +  StageHandle FindSection(const string& name) const;
-+  const path& file_path() const { return file_path_; }
 +  uint64_t build_id() const { return build_id_; }
 +
 + private:
-+  friend class RewritePackBuilder;
++  friend class RewriteStore;
 +  class Impl;
 +
-+  explicit RewritePack(const path& file_path);
++  RewritePack(const path& file_path, uint64_t offset, uint64_t size);
 +  bool Open();
 +
 +  path file_path_;
++  uint64_t offset_ = 0;
++  uint64_t size_ = 0;
 +  uint64_t build_id_ = 0;
 +  std::unique_ptr<Impl> impl_;
 +};
@@ -1691,18 +1602,1594 @@ index 0000000..868e409
 +
 +class RIME_DLL RewritePackBuilder {
 + public:
-+  static bool IsUpToDate(const path& file_path, uint64_t source_checksum);
-+
 +  bool Build(const path& output_path,
 +             const vector<RewriteSectionData>& sections) const;
-+  bool Build(const path& output_path,
-+             const vector<RewriteSectionData>& sections,
-+             uint64_t source_checksum) const;
 +};
 +
 +}  // namespace rime
 +
 +#endif  // RIME_REWRITE_PACK_H_
+diff --git a/src/rime/dict/rewrite_store.cc b/src/rime/dict/rewrite_store.cc
+new file mode 100644
+index 0000000..d17c8d5
+--- /dev/null
++++ b/src/rime/dict/rewrite_store.cc
+@@ -0,0 +1,1486 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#endif
++
++#include <rime/dict/rewrite_store.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <mutex>
++#include <string_view>
++#include <system_error>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++namespace rime {
++namespace {
++
++constexpr char kStoreMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'S', '1'};
++constexpr char kObjectMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'O', '1'};
++constexpr char kIndexMagic[] = {'R', 'I', 'M', 'E', 'R', 'W', 'I', '1'};
++constexpr uint32_t kStoreVersion = 1;
++constexpr uint32_t kObjectVersion = 1;
++constexpr uint32_t kIndexVersion = 1;
++constexpr uint64_t kSuperblockSize = 64;
++constexpr uint64_t kSuperblockCount = 2;
++constexpr uint64_t kStoreDataOffset = kSuperblockSize * kSuperblockCount;
++constexpr uint64_t kObjectHeaderSize = 64;
++constexpr uint64_t kIndexHeaderSize = 64;
++constexpr uint64_t kIndexStageRecordSize = 32;
++constexpr uint64_t kIndexSchemaRecordSize = 32;
++constexpr uint64_t kIndexSectionRecordSize = 32;
++
++struct RewriteStageIdHash {
++  size_t operator()(const RewriteStageId& id) const {
++    uint64_t value = id.high;
++    value ^= id.low + 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
++    return static_cast<size_t>(value);
++  }
++};
++
++struct StoreSuperblock {
++  uint64_t generation = 0;
++  uint64_t index_offset = 0;
++  uint64_t index_size = 0;
++  uint64_t committed_size = 0;
++  uint64_t index_hash = 0;
++};
++
++struct StageLocation {
++  uint64_t object_offset = 0;
++  uint64_t object_size = 0;
++  uint64_t payload_offset = 0;
++  uint64_t payload_size = 0;
++  uint64_t payload_hash = 0;
++};
++
++struct StoreSnapshot {
++  uint64_t generation = 0;
++  uint64_t committed_size = 0;
++  uint64_t index_offset = 0;
++  uint64_t index_size = 0;
++  uint64_t index_hash = 0;
++  std::unordered_map<RewriteStageId, StageLocation, RewriteStageIdHash> stages;
++  std::unordered_map<string, vector<RewriteStageReference>> schemas;
++};
++
++inline uint32_t ReadU32(const char* p) {
++  const auto* b = reinterpret_cast<const unsigned char*>(p);
++  return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
++         (static_cast<uint32_t>(b[2]) << 16) |
++         (static_cast<uint32_t>(b[3]) << 24);
++}
++
++inline uint64_t ReadU64(const char* p) {
++  uint64_t value = 0;
++  for (int i = 7; i >= 0; --i) {
++    value =
++        (value << 8) | static_cast<uint64_t>(static_cast<unsigned char>(p[i]));
++  }
++  return value;
++}
++
++void WriteU32(std::ostream* out, uint32_t value) {
++  std::array<char, 4> bytes{};
++  for (size_t i = 0; i < bytes.size(); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  out->write(bytes.data(), bytes.size());
++}
++
++void WriteU64(std::ostream* out, uint64_t value) {
++  std::array<char, 8> bytes{};
++  for (size_t i = 0; i < bytes.size(); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  out->write(bytes.data(), bytes.size());
++}
++
++void WriteZeros(std::ostream* out, size_t count) {
++  static constexpr std::array<char, 64> kZeros{};
++  while (count > 0) {
++    const size_t chunk = std::min(count, kZeros.size());
++    out->write(kZeros.data(), chunk);
++    count -= chunk;
++  }
++}
++
++bool InRange(uint64_t offset, uint64_t size, uint64_t file_size) {
++  return offset <= file_size && size <= file_size - offset;
++}
++
++bool FitsU32(size_t value) {
++  return value <= std::numeric_limits<uint32_t>::max();
++}
++
++std::atomic<uint64_t> g_temp_counter{0};
++
++path MakeTemporaryPath(const path& output_path) {
++  const uint64_t now = static_cast<uint64_t>(
++      std::chrono::steady_clock::now().time_since_epoch().count());
++  const uint64_t thread = static_cast<uint64_t>(
++      std::hash<std::thread::id>{}(std::this_thread::get_id()));
++  const uint64_t sequence = g_temp_counter.fetch_add(1);
++
++  path temporary_path = output_path;
++  const string suffix = ".tmp." + std::to_string(now) + "." +
++                        std::to_string(thread) + "." + std::to_string(sequence);
++  temporary_path += path(suffix);
++  return temporary_path;
++}
++
++class TemporaryFileGuard {
++ public:
++  explicit TemporaryFileGuard(path file_path)
++      : file_path_(std::move(file_path)) {}
++  ~TemporaryFileGuard() {
++    if (!committed_) {
++      std::error_code ec;
++      std::filesystem::remove(file_path_, ec);
++    }
++  }
++
++  void Commit() { committed_ = true; }
++
++ private:
++  path file_path_;
++  bool committed_ = false;
++};
++
++bool InstallAtomically(const path& temporary_path,
++                       const path& output_path,
++                       std::error_code* error) {
++  if (!error) {
++    return false;
++  }
++  error->clear();
++  std::filesystem::rename(temporary_path, output_path, *error);
++  if (!*error) {
++    return true;
++  }
++#ifdef _WIN32
++  if (MoveFileExW(temporary_path.wstring().c_str(),
++                  output_path.wstring().c_str(),
++                  MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++    error->clear();
++    return true;
++  }
++  *error =
++      std::error_code(static_cast<int>(GetLastError()), std::system_category());
++#endif
++  return false;
++}
++
++uint64_t HashBytes(uint64_t hash, const char* data, size_t size) {
++  constexpr uint64_t kPrime = 1099511628211ULL;
++  for (size_t i = 0; i < size; ++i) {
++    hash ^= static_cast<unsigned char>(data[i]);
++    hash *= kPrime;
++  }
++  return hash;
++}
++
++uint64_t AlignValue(uint64_t value, uint64_t alignment) {
++  return value + (alignment - value % alignment) % alignment;
++}
++
++string StageIdString(const RewriteStageId& id) {
++  static constexpr char kHex[] = "0123456789abcdef";
++  string result(32, '0');
++  for (size_t i = 0; i < 16; ++i) {
++    const size_t high_shift = (15 - i) * 4;
++    result[i] = kHex[(id.high >> high_shift) & 0x0f];
++    result[16 + i] = kHex[(id.low >> high_shift) & 0x0f];
++  }
++  return result;
++}
++
++bool StageIdLess(const RewriteStageId& lhs, const RewriteStageId& rhs) {
++  return lhs.high < rhs.high || (lhs.high == rhs.high && lhs.low < rhs.low);
++}
++
++uint64_t StoreHash(const char* data, size_t size) {
++  return HashBytes(1469598103934665603ULL, data, size);
++}
++
++std::array<char, kSuperblockSize> SerializeSuperblock(
++    const StoreSuperblock& block) {
++  std::array<char, kSuperblockSize> bytes{};
++  std::memcpy(bytes.data(), kStoreMagic, sizeof(kStoreMagic));
++  auto put32 = [&](size_t offset, uint32_t value) {
++    for (size_t i = 0; i < 4; ++i) {
++      bytes[offset + i] = static_cast<char>((value >> (i * 8)) & 0xff);
++    }
++  };
++  auto put64 = [&](size_t offset, uint64_t value) {
++    for (size_t i = 0; i < 8; ++i) {
++      bytes[offset + i] = static_cast<char>((value >> (i * 8)) & 0xff);
++    }
++  };
++  put32(8, kStoreVersion);
++  put32(12, 0);
++  put64(16, block.generation);
++  put64(24, block.index_offset);
++  put64(32, block.index_size);
++  put64(40, block.committed_size);
++  put64(48, block.index_hash);
++  put64(56, StoreHash(bytes.data(), 56));
++  return bytes;
++}
++
++bool ParseSuperblock(const char* data,
++                     uint64_t actual_size,
++                     StoreSuperblock* block) {
++  if (!data || !block ||
++      std::memcmp(data, kStoreMagic, sizeof(kStoreMagic)) != 0 ||
++      ReadU32(data + 8) != kStoreVersion ||
++      ReadU64(data + 56) != StoreHash(data, 56)) {
++    return false;
++  }
++
++  StoreSuperblock candidate;
++  candidate.generation = ReadU64(data + 16);
++  candidate.index_offset = ReadU64(data + 24);
++  candidate.index_size = ReadU64(data + 32);
++  candidate.committed_size = ReadU64(data + 40);
++  candidate.index_hash = ReadU64(data + 48);
++  if (candidate.generation == 0 || candidate.committed_size > actual_size ||
++      candidate.committed_size < kStoreDataOffset ||
++      candidate.index_size < kIndexHeaderSize ||
++      candidate.index_offset < kStoreDataOffset ||
++      !InRange(candidate.index_offset, candidate.index_size,
++               candidate.committed_size)) {
++    return false;
++  }
++  *block = candidate;
++  return true;
++}
++
++bool FlushFileDurably(const path& file_path) {
++#ifdef _WIN32
++  HANDLE handle =
++      CreateFileW(file_path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
++                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (handle == INVALID_HANDLE_VALUE) {
++    return false;
++  }
++  const bool ok = FlushFileBuffers(handle) != 0;
++  CloseHandle(handle);
++  return ok;
++#else
++  const int fd = open(file_path.c_str(), O_RDONLY);
++  if (fd < 0) {
++    return false;
++  }
++  const bool ok = fsync(fd) == 0;
++  close(fd);
++  return ok;
++#endif
++}
++
++bool InitializeStoreFile(const path& file_path) {
++  std::error_code ec;
++  const path parent = file_path.parent_path();
++  if (!parent.empty()) {
++    std::filesystem::create_directories(parent, ec);
++    if (ec) {
++      LOG(ERROR) << "cannot create rewrite store directory '" << parent
++                 << "': " << ec.message();
++      return false;
++    }
++  }
++
++  std::ofstream out(static_cast<const std::filesystem::path&>(file_path),
++                    std::ios::binary | std::ios::trunc);
++  if (!out) {
++    LOG(ERROR) << "cannot create shared rewrite store '" << file_path << "'.";
++    return false;
++  }
++  WriteZeros(&out, kStoreDataOffset);
++  out.close();
++  return out && FlushFileDurably(file_path);
++}
++
++std::array<char, kObjectHeaderSize> SerializeObjectHeader(
++    const RewriteStageId& id,
++    uint64_t payload_size,
++    uint64_t payload_hash) {
++  std::array<char, kObjectHeaderSize> bytes{};
++  std::memcpy(bytes.data(), kObjectMagic, sizeof(kObjectMagic));
++  auto put32 = [&](size_t offset, uint32_t value) {
++    for (size_t i = 0; i < 4; ++i) {
++      bytes[offset + i] = static_cast<char>((value >> (i * 8)) & 0xff);
++    }
++  };
++  auto put64 = [&](size_t offset, uint64_t value) {
++    for (size_t i = 0; i < 8; ++i) {
++      bytes[offset + i] = static_cast<char>((value >> (i * 8)) & 0xff);
++    }
++  };
++  put32(8, kObjectVersion);
++  put32(12, kObjectHeaderSize);
++  put64(16, id.high);
++  put64(24, id.low);
++  put64(32, payload_size);
++  put64(40, payload_hash);
++  put64(48, kObjectHeaderSize + payload_size);
++  put64(56, StoreHash(bytes.data(), 56));
++  return bytes;
++}
++
++bool ReadObjectHeader(std::istream* in,
++                      uint64_t object_offset,
++                      uint64_t committed_size,
++                      const RewriteStageId* expected_id,
++                      StageLocation* location) {
++  if (!in || !location ||
++      !InRange(object_offset, kObjectHeaderSize, committed_size)) {
++    return false;
++  }
++
++  std::array<char, kObjectHeaderSize> bytes{};
++  in->clear();
++  in->seekg(static_cast<std::streamoff>(object_offset));
++  in->read(bytes.data(), bytes.size());
++  if (!*in ||
++      std::memcmp(bytes.data(), kObjectMagic, sizeof(kObjectMagic)) != 0 ||
++      ReadU32(bytes.data() + 8) != kObjectVersion ||
++      ReadU32(bytes.data() + 12) != kObjectHeaderSize ||
++      ReadU64(bytes.data() + 56) != StoreHash(bytes.data(), 56)) {
++    return false;
++  }
++
++  const RewriteStageId id{ReadU64(bytes.data() + 16),
++                          ReadU64(bytes.data() + 24)};
++  const uint64_t payload_size = ReadU64(bytes.data() + 32);
++  const uint64_t payload_hash = ReadU64(bytes.data() + 40);
++  const uint64_t object_size = ReadU64(bytes.data() + 48);
++  if ((expected_id && id != *expected_id) || id.empty() ||
++      object_size != kObjectHeaderSize + payload_size ||
++      !InRange(object_offset, object_size, committed_size)) {
++    return false;
++  }
++
++  location->object_offset = object_offset;
++  location->object_size = object_size;
++  location->payload_offset = object_offset + kObjectHeaderSize;
++  location->payload_size = payload_size;
++  location->payload_hash = payload_hash;
++  return true;
++}
++
++struct SerializedSchemaRecord {
++  string name;
++  uint64_t name_offset = 0;
++  uint64_t section_table_offset = 0;
++  vector<RewriteStageReference> sections;
++  vector<uint64_t> section_name_offsets;
++};
++
++bool SerializeStoreIndex(const StoreSnapshot& snapshot,
++                         uint64_t generation,
++                         string* bytes) {
++  if (!bytes) {
++    return false;
++  }
++
++  vector<std::pair<RewriteStageId, StageLocation>> stages;
++  stages.reserve(snapshot.stages.size());
++  for (const auto& item : snapshot.stages) {
++    stages.push_back(item);
++  }
++  std::sort(stages.begin(), stages.end(), [](const auto& lhs, const auto& rhs) {
++    return StageIdLess(lhs.first, rhs.first);
++  });
++
++  vector<SerializedSchemaRecord> schemas;
++  schemas.reserve(snapshot.schemas.size());
++  uint64_t total_sections = 0;
++  for (const auto& item : snapshot.schemas) {
++    SerializedSchemaRecord record;
++    record.name = item.first;
++    record.sections = item.second;
++    total_sections += record.sections.size();
++    schemas.push_back(std::move(record));
++  }
++  std::sort(
++      schemas.begin(), schemas.end(),
++      [](const auto& lhs, const auto& rhs) { return lhs.name < rhs.name; });
++
++  if (!FitsU32(stages.size()) || !FitsU32(schemas.size()) ||
++      total_sections > std::numeric_limits<uint32_t>::max()) {
++    LOG(ERROR)
++        << "shared rewrite store index exceeds the supported count limit.";
++    return false;
++  }
++
++  const uint64_t stage_table_offset = kIndexHeaderSize;
++  const uint64_t schema_table_offset =
++      stage_table_offset + stages.size() * kIndexStageRecordSize;
++  uint64_t section_cursor =
++      schema_table_offset + schemas.size() * kIndexSchemaRecordSize;
++  uint64_t names_cursor =
++      section_cursor + total_sections * kIndexSectionRecordSize;
++
++  for (auto& schema : schemas) {
++    schema.section_table_offset = section_cursor;
++    section_cursor += schema.sections.size() * kIndexSectionRecordSize;
++    schema.name_offset = names_cursor;
++    names_cursor += schema.name.size();
++    schema.section_name_offsets.reserve(schema.sections.size());
++    for (const auto& section : schema.sections) {
++      schema.section_name_offsets.push_back(names_cursor);
++      names_cursor += section.name.size();
++    }
++  }
++  const uint64_t index_size = names_cursor;
++  if (index_size > std::numeric_limits<size_t>::max()) {
++    return false;
++  }
++
++  std::ostringstream out(std::ios::binary | std::ios::out);
++  out.write(kIndexMagic, sizeof(kIndexMagic));
++  WriteU32(&out, kIndexVersion);
++  WriteU32(&out, static_cast<uint32_t>(stages.size()));
++  WriteU32(&out, static_cast<uint32_t>(schemas.size()));
++  WriteU32(&out, 0);
++  WriteU64(&out, generation);
++  WriteU64(&out, stage_table_offset);
++  WriteU64(&out, schema_table_offset);
++  WriteU64(&out, index_size);
++  WriteU64(&out, 0);
++
++  for (const auto& stage : stages) {
++    WriteU64(&out, stage.first.high);
++    WriteU64(&out, stage.first.low);
++    WriteU64(&out, stage.second.object_offset);
++    WriteU64(&out, stage.second.object_size);
++  }
++  for (const auto& schema : schemas) {
++    WriteU64(&out, schema.name_offset);
++    WriteU32(&out, static_cast<uint32_t>(schema.name.size()));
++    WriteU32(&out, static_cast<uint32_t>(schema.sections.size()));
++    WriteU64(&out, schema.section_table_offset);
++    WriteU64(&out, 0);
++  }
++  for (const auto& schema : schemas) {
++    for (size_t i = 0; i < schema.sections.size(); ++i) {
++      const auto& section = schema.sections[i];
++      WriteU64(&out, schema.section_name_offsets[i]);
++      WriteU32(&out, static_cast<uint32_t>(section.name.size()));
++      WriteU32(&out, 0);
++      WriteU64(&out, section.stage_id.high);
++      WriteU64(&out, section.stage_id.low);
++    }
++  }
++  for (const auto& schema : schemas) {
++    out.write(schema.name.data(), schema.name.size());
++    for (const auto& section : schema.sections) {
++      out.write(section.name.data(), section.name.size());
++    }
++  }
++
++  *bytes = out.str();
++  return out && bytes->size() == index_size;
++}
++
++bool ParseStoreIndex(const path& file_path,
++                     const StoreSuperblock& block,
++                     StoreSnapshot* snapshot) {
++  if (!snapshot || block.index_size > std::numeric_limits<size_t>::max()) {
++    return false;
++  }
++
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    return false;
++  }
++  string bytes(static_cast<size_t>(block.index_size), '\0');
++  in.seekg(static_cast<std::streamoff>(block.index_offset));
++  in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
++  if (!in || StoreHash(bytes.data(), bytes.size()) != block.index_hash ||
++      bytes.size() < kIndexHeaderSize ||
++      std::memcmp(bytes.data(), kIndexMagic, sizeof(kIndexMagic)) != 0 ||
++      ReadU32(bytes.data() + 8) != kIndexVersion ||
++      ReadU64(bytes.data() + 24) != block.generation ||
++      ReadU64(bytes.data() + 48) != bytes.size()) {
++    return false;
++  }
++
++  const uint32_t stage_count = ReadU32(bytes.data() + 12);
++  const uint32_t schema_count = ReadU32(bytes.data() + 16);
++  const uint64_t stage_table_offset = ReadU64(bytes.data() + 32);
++  const uint64_t schema_table_offset = ReadU64(bytes.data() + 40);
++  if (!InRange(stage_table_offset,
++               static_cast<uint64_t>(stage_count) * kIndexStageRecordSize,
++               bytes.size()) ||
++      !InRange(schema_table_offset,
++               static_cast<uint64_t>(schema_count) * kIndexSchemaRecordSize,
++               bytes.size())) {
++    return false;
++  }
++
++  StoreSnapshot parsed;
++  parsed.generation = block.generation;
++  parsed.committed_size = block.committed_size;
++  parsed.index_offset = block.index_offset;
++  parsed.index_size = block.index_size;
++  parsed.index_hash = block.index_hash;
++  parsed.stages.reserve(stage_count);
++
++  for (uint32_t i = 0; i < stage_count; ++i) {
++    const char* p = bytes.data() + stage_table_offset +
++                    static_cast<uint64_t>(i) * kIndexStageRecordSize;
++    const RewriteStageId id{ReadU64(p), ReadU64(p + 8)};
++    const uint64_t object_offset = ReadU64(p + 16);
++    const uint64_t object_size = ReadU64(p + 24);
++    if (id.empty() || object_size < kObjectHeaderSize ||
++        !InRange(object_offset, object_size, block.committed_size)) {
++      return false;
++    }
++    StageLocation location;
++    location.object_offset = object_offset;
++    location.object_size = object_size;
++    location.payload_offset = object_offset + kObjectHeaderSize;
++    location.payload_size = object_size - kObjectHeaderSize;
++    if (!parsed.stages.emplace(id, location).second) {
++      return false;
++    }
++  }
++
++  parsed.schemas.reserve(schema_count);
++  for (uint32_t i = 0; i < schema_count; ++i) {
++    const char* p = bytes.data() + schema_table_offset +
++                    static_cast<uint64_t>(i) * kIndexSchemaRecordSize;
++    const uint64_t name_offset = ReadU64(p);
++    const uint32_t name_size = ReadU32(p + 8);
++    const uint32_t section_count = ReadU32(p + 12);
++    const uint64_t section_table_offset = ReadU64(p + 16);
++    if (name_size == 0 || !InRange(name_offset, name_size, bytes.size()) ||
++        !InRange(section_table_offset,
++                 static_cast<uint64_t>(section_count) * kIndexSectionRecordSize,
++                 bytes.size())) {
++      return false;
++    }
++
++    string schema_name(bytes.data() + name_offset, name_size);
++    vector<RewriteStageReference> sections;
++    sections.reserve(section_count);
++    std::unordered_set<string> names;
++    names.reserve(section_count);
++    for (uint32_t j = 0; j < section_count; ++j) {
++      const char* sp = bytes.data() + section_table_offset +
++                       static_cast<uint64_t>(j) * kIndexSectionRecordSize;
++      const uint64_t section_name_offset = ReadU64(sp);
++      const uint32_t section_name_size = ReadU32(sp + 8);
++      const RewriteStageId id{ReadU64(sp + 16), ReadU64(sp + 24)};
++      if (section_name_size == 0 ||
++          !InRange(section_name_offset, section_name_size, bytes.size()) ||
++          parsed.stages.find(id) == parsed.stages.end()) {
++        return false;
++      }
++      string section_name(bytes.data() + section_name_offset,
++                          section_name_size);
++      if (!names.insert(section_name).second) {
++        return false;
++      }
++      sections.push_back({std::move(section_name), id});
++    }
++    if (!parsed.schemas.emplace(std::move(schema_name), std::move(sections))
++             .second) {
++      return false;
++    }
++  }
++
++  *snapshot = std::move(parsed);
++  return true;
++}
++
++bool LoadStoreSnapshot(const path& file_path, StoreSnapshot* snapshot) {
++  if (!snapshot) {
++    return false;
++  }
++  std::error_code ec;
++  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
++  if (ec || actual_size < kStoreDataOffset) {
++    return false;
++  }
++
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    return false;
++  }
++  std::array<char, kStoreDataOffset> header{};
++  in.read(header.data(), header.size());
++  if (!in) {
++    return false;
++  }
++
++  vector<StoreSuperblock> candidates;
++  for (uint64_t slot = 0; slot < kSuperblockCount; ++slot) {
++    StoreSuperblock block;
++    if (ParseSuperblock(header.data() + slot * kSuperblockSize, actual_size,
++                        &block)) {
++      candidates.push_back(block);
++    }
++  }
++  std::sort(candidates.begin(), candidates.end(),
++            [](const auto& lhs, const auto& rhs) {
++              return lhs.generation > rhs.generation;
++            });
++  for (const auto& block : candidates) {
++    StoreSnapshot parsed;
++    if (ParseStoreIndex(file_path, block, &parsed)) {
++      *snapshot = std::move(parsed);
++      return true;
++    }
++  }
++
++  // A freshly created store has only the reserved superblock area.
++  if (actual_size == kStoreDataOffset && candidates.empty()) {
++    *snapshot = StoreSnapshot{};
++    snapshot->committed_size = kStoreDataOffset;
++    return true;
++  }
++  return false;
++}
++
++bool ReadStoreGeneration(const path& file_path, uint64_t* generation) {
++  if (!generation) {
++    return false;
++  }
++  std::error_code ec;
++  const uint64_t actual_size = std::filesystem::file_size(file_path, ec);
++  if (ec || actual_size < kStoreDataOffset) {
++    return false;
++  }
++
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path),
++                   std::ios::binary);
++  if (!in) {
++    return false;
++  }
++  std::array<char, kStoreDataOffset> header{};
++  in.read(header.data(), header.size());
++  if (!in) {
++    return false;
++  }
++
++  uint64_t latest = 0;
++  for (uint64_t slot = 0; slot < kSuperblockCount; ++slot) {
++    StoreSuperblock block;
++    if (ParseSuperblock(header.data() + slot * kSuperblockSize, actual_size,
++                        &block)) {
++      latest = std::max(latest, block.generation);
++    }
++  }
++  if (latest == 0) {
++    return false;
++  }
++  *generation = latest;
++  return true;
++}
++
++bool WriteSuperblock(const path& file_path,
++                     uint64_t slot,
++                     const StoreSuperblock& block) {
++  if (slot >= kSuperblockCount) {
++    return false;
++  }
++  std::fstream io(static_cast<const std::filesystem::path&>(file_path),
++                  std::ios::binary | std::ios::in | std::ios::out);
++  if (!io) {
++    return false;
++  }
++  const auto bytes = SerializeSuperblock(block);
++  io.seekp(static_cast<std::streamoff>(slot * kSuperblockSize));
++  io.write(bytes.data(), bytes.size());
++  io.flush();
++  io.close();
++  return io && FlushFileDurably(file_path);
++}
++
++bool AppendIndexSnapshot(const path& file_path,
++                         StoreSnapshot* snapshot,
++                         uint64_t* write_end) {
++  if (!snapshot || !write_end) {
++    return false;
++  }
++  const uint64_t generation = snapshot->generation + 1;
++  string index;
++  if (!SerializeStoreIndex(*snapshot, generation, &index)) {
++    return false;
++  }
++
++  std::fstream io(static_cast<const std::filesystem::path&>(file_path),
++                  std::ios::binary | std::ios::in | std::ios::out);
++  if (!io) {
++    return false;
++  }
++  const uint64_t index_offset = AlignValue(*write_end, 8);
++  io.seekp(static_cast<std::streamoff>(*write_end));
++  WriteZeros(&io, static_cast<size_t>(index_offset - *write_end));
++  io.write(index.data(), static_cast<std::streamsize>(index.size()));
++  io.flush();
++  if (!io) {
++    return false;
++  }
++  const uint64_t committed_size = index_offset + index.size();
++  io.close();
++  if (!FlushFileDurably(file_path)) {
++    return false;
++  }
++
++  StoreSuperblock block;
++  block.generation = generation;
++  block.index_offset = index_offset;
++  block.index_size = index.size();
++  block.committed_size = committed_size;
++  block.index_hash = StoreHash(index.data(), index.size());
++  if (!WriteSuperblock(file_path, generation % kSuperblockCount, block)) {
++    return false;
++  }
++
++  snapshot->generation = generation;
++  snapshot->index_offset = block.index_offset;
++  snapshot->index_size = block.index_size;
++  snapshot->index_hash = block.index_hash;
++  snapshot->committed_size = committed_size;
++  *write_end = committed_size;
++  return true;
++}
++
++}  // namespace
++
++class RewriteStore::Impl {
++ public:
++  StoreSnapshot snapshot;
++};
++
++RewriteStore::RewriteStore(const path& file_path)
++    : file_path_(file_path), impl_(new Impl) {}
++
++RewriteStore::~RewriteStore() = default;
++
++bool RewriteStore::Open() {
++  if (!LoadStoreSnapshot(file_path_, &impl_->snapshot) ||
++      impl_->snapshot.generation == 0) {
++    LOG(ERROR) << "shared rewrite store '" << file_path_
++               << "' has no valid committed index; redeploy the workspace.";
++    return false;
++  }
++  generation_ = impl_->snapshot.generation;
++  return true;
++}
++
++std::shared_ptr<RewriteStore> RewriteStore::OpenCached(const path& file_path) {
++  static std::mutex mutex;
++  static std::unordered_map<string, std::weak_ptr<RewriteStore>> cache;
++
++  uint64_t generation = 0;
++  if (!ReadStoreGeneration(file_path, &generation)) {
++    return nullptr;
++  }
++  const string key = file_path.u8string();
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = cache.find(key);
++    if (found != cache.end()) {
++      if (auto cached = found->second.lock()) {
++        if (cached->generation() == generation) {
++          return cached;
++        }
++      }
++      cache.erase(found);
++    }
++  }
++
++  auto store = std::shared_ptr<RewriteStore>(new RewriteStore(file_path));
++  if (!store->Open()) {
++    return nullptr;
++  }
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = cache.find(key);
++    if (found != cache.end()) {
++      if (auto cached = found->second.lock()) {
++        if (cached->generation() == store->generation()) {
++          return cached;
++        }
++      }
++    }
++    cache[key] = store;
++  }
++  return store;
++}
++
++bool RewriteStore::FindStageId(const string& schema_id,
++                               const string& section_name,
++                               RewriteStageId* stage_id) const {
++  if (!stage_id) {
++    return false;
++  }
++  const auto schema = impl_->snapshot.schemas.find(schema_id);
++  if (schema == impl_->snapshot.schemas.end()) {
++    return false;
++  }
++  for (const auto& section : schema->second) {
++    if (section.name == section_name) {
++      *stage_id = section.stage_id;
++      return true;
++    }
++  }
++  return false;
++}
++
++std::shared_ptr<const RewritePack> RewriteStore::OpenStage(
++    const RewriteStageId& stage_id) const {
++  const auto found = impl_->snapshot.stages.find(stage_id);
++  if (found == impl_->snapshot.stages.end()) {
++    return nullptr;
++  }
++
++  static std::mutex mutex;
++  static std::unordered_map<string, std::weak_ptr<const RewritePack>> cache;
++  const string cache_key =
++      file_path_.u8string() + "#" + StageIdString(stage_id);
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto cached = cache.find(cache_key);
++    if (cached != cache.end()) {
++      if (auto pack = cached->second.lock()) {
++        return pack;
++      }
++      cache.erase(cached);
++    }
++  }
++
++  const StageLocation& location = found->second;
++  std::ifstream in(static_cast<const std::filesystem::path&>(file_path_),
++                   std::ios::binary);
++  StageLocation checked;
++  if (!in ||
++      !ReadObjectHeader(&in, location.object_offset,
++                        impl_->snapshot.committed_size, &stage_id, &checked) ||
++      checked.object_size != location.object_size) {
++    LOG(ERROR) << "shared rewrite stage " << StageIdString(stage_id)
++               << " has an invalid object header; redeploy the workspace.";
++    return nullptr;
++  }
++
++  auto pack = std::shared_ptr<RewritePack>(new RewritePack(
++      file_path_, checked.payload_offset, checked.payload_size));
++  if (!pack->Open()) {
++    return nullptr;
++  }
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto cached = cache.find(cache_key);
++    if (cached != cache.end()) {
++      if (auto existing = cached->second.lock()) {
++        return existing;
++      }
++    }
++    cache[cache_key] = pack;
++  }
++  return pack;
++}
++
++namespace {
++
++bool StoreNeedsCompaction(const StoreSnapshot& snapshot) {
++  std::unordered_set<RewriteStageId, RewriteStageIdHash> live_ids;
++  for (const auto& schema : snapshot.schemas) {
++    for (const auto& section : schema.second) {
++      live_ids.insert(section.stage_id);
++    }
++  }
++  if (live_ids.size() != snapshot.stages.size()) {
++    return true;
++  }
++
++  uint64_t write_end = kStoreDataOffset;
++  for (const auto& item : snapshot.stages) {
++    write_end = AlignValue(write_end, 8) + item.second.object_size;
++  }
++  string index;
++  if (!SerializeStoreIndex(snapshot, snapshot.generation, &index)) {
++    return true;
++  }
++  const uint64_t index_offset = AlignValue(write_end, 8);
++  return snapshot.index_offset != index_offset ||
++         snapshot.index_size != index.size() ||
++         snapshot.committed_size != index_offset + index.size();
++}
++
++struct RewriteWorkspaceSnapshot {
++  bool had_file = false;
++  bool dirty = false;
++  uint64_t committed_size = 0;
++  StoreSnapshot working;
++  uint64_t write_end = kStoreDataOffset;
++};
++
++std::mutex& RewriteWorkspaceMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++std::unordered_map<string, std::shared_ptr<RewriteWorkspaceSnapshot>>&
++RewriteWorkspaces() {
++  static std::unordered_map<string, std::shared_ptr<RewriteWorkspaceSnapshot>>
++      workspaces;
++  return workspaces;
++}
++
++std::shared_ptr<RewriteWorkspaceSnapshot> FindRewriteWorkspace(
++    const path& file_path) {
++  std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++  const auto found = RewriteWorkspaces().find(file_path.u8string());
++  return found == RewriteWorkspaces().end() ? nullptr : found->second;
++}
++
++bool RestoreRewriteWorkspace(const path& file_path,
++                             const RewriteWorkspaceSnapshot& snapshot) {
++  std::error_code ec;
++  if (!snapshot.had_file) {
++    std::filesystem::remove(file_path, ec);
++    return !ec;
++  }
++  if (!std::filesystem::exists(file_path, ec) || ec) {
++    return false;
++  }
++  std::filesystem::resize_file(file_path, snapshot.committed_size, ec);
++  return !ec && FlushFileDurably(file_path);
++}
++
++void FinishRewriteWorkspace(const path& file_path) {
++  std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++  RewriteWorkspaces().erase(file_path.u8string());
++}
++
++}  // namespace
++
++class RewriteStoreWriter::Impl {
++ public:
++  explicit Impl(path path_value) : file_path(std::move(path_value)) {}
++
++  StoreSnapshot& Snapshot() {
++    return workspace ? workspace->working : snapshot;
++  }
++  const StoreSnapshot& Snapshot() const {
++    return workspace ? workspace->working : snapshot;
++  }
++  uint64_t& WriteEnd() { return workspace ? workspace->write_end : write_end; }
++  uint64_t WriteEnd() const {
++    return workspace ? workspace->write_end : write_end;
++  }
++
++  path file_path;
++  StoreSnapshot snapshot;
++  uint64_t write_end = kStoreDataOffset;
++  std::shared_ptr<RewriteWorkspaceSnapshot> workspace;
++  bool opened = false;
++};
++
++RewriteStoreWriter::RewriteStoreWriter(const path& file_path)
++    : impl_(new Impl(file_path)) {}
++
++RewriteStoreWriter::~RewriteStoreWriter() = default;
++
++bool RewriteStoreWriter::Open() {
++  if (impl_->opened) {
++    return true;
++  }
++
++  std::error_code ec;
++  if (!std::filesystem::exists(impl_->file_path, ec)) {
++    if (ec || !InitializeStoreFile(impl_->file_path)) {
++      return false;
++    }
++  } else {
++    const uint64_t size = std::filesystem::file_size(impl_->file_path, ec);
++    if (ec) {
++      return false;
++    }
++    if (size == 0 && !InitializeStoreFile(impl_->file_path)) {
++      return false;
++    }
++  }
++
++  impl_->workspace = FindRewriteWorkspace(impl_->file_path);
++  if (impl_->workspace) {
++    const uint64_t actual_size =
++        std::filesystem::file_size(impl_->file_path, ec);
++    if (ec) {
++      return false;
++    }
++    if (actual_size < impl_->WriteEnd()) {
++      LOG(ERROR) << "shared rewrite store '" << impl_->file_path
++                 << "' was truncated during workspace deployment.";
++      return false;
++    }
++    if (actual_size > impl_->WriteEnd()) {
++      std::filesystem::resize_file(impl_->file_path, impl_->WriteEnd(), ec);
++      if (ec) {
++        LOG(ERROR) << "cannot discard an unfinished rewrite-stage tail from '"
++                   << impl_->file_path << "': " << ec.message();
++        return false;
++      }
++    }
++    impl_->opened = true;
++    return true;
++  }
++
++  if (!LoadStoreSnapshot(impl_->file_path, &impl_->snapshot)) {
++    LOG(ERROR) << "shared rewrite store '" << impl_->file_path
++               << "' is corrupted; remove it and redeploy the workspace.";
++    return false;
++  }
++
++  const uint64_t actual_size = std::filesystem::file_size(impl_->file_path, ec);
++  if (ec) {
++    return false;
++  }
++  if (actual_size > impl_->snapshot.committed_size) {
++    std::filesystem::resize_file(impl_->file_path,
++                                 impl_->snapshot.committed_size, ec);
++    if (ec) {
++      LOG(ERROR) << "cannot discard an uncommitted rewrite-store tail from '"
++                 << impl_->file_path << "': " << ec.message();
++      return false;
++    }
++  }
++
++  impl_->write_end = impl_->snapshot.committed_size;
++  impl_->opened = true;
++  return true;
++}
++
++bool RewriteStoreWriter::BeginWorkspace() {
++  std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++  const string key = impl_->file_path.u8string();
++  if (RewriteWorkspaces().find(key) != RewriteWorkspaces().end()) {
++    LOG(ERROR) << "rewrite workspace transaction already active for '"
++               << impl_->file_path << "'.";
++    return false;
++  }
++
++  auto snapshot = std::make_shared<RewriteWorkspaceSnapshot>();
++  std::error_code ec;
++  if (std::filesystem::exists(impl_->file_path, ec)) {
++    if (ec) {
++      return false;
++    }
++    StoreSnapshot current;
++    if (!LoadStoreSnapshot(impl_->file_path, &current)) {
++      return false;
++    }
++    snapshot->had_file = true;
++    snapshot->dirty = StoreNeedsCompaction(current);
++    snapshot->committed_size = current.committed_size;
++    snapshot->working = current;
++    snapshot->write_end = current.committed_size;
++    const uint64_t actual_size =
++        std::filesystem::file_size(impl_->file_path, ec);
++    if (ec) {
++      return false;
++    }
++    if (actual_size != current.committed_size) {
++      std::filesystem::resize_file(impl_->file_path, current.committed_size,
++                                   ec);
++      if (ec || !FlushFileDurably(impl_->file_path)) {
++        return false;
++      }
++    }
++  }
++  RewriteWorkspaces().emplace(key, std::move(snapshot));
++  return true;
++}
++
++bool RewriteStoreWriter::AbortWorkspace() {
++  std::shared_ptr<RewriteWorkspaceSnapshot> snapshot;
++  {
++    std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++    const string key = impl_->file_path.u8string();
++    const auto found = RewriteWorkspaces().find(key);
++    if (found == RewriteWorkspaces().end()) {
++      return true;
++    }
++    snapshot = found->second;
++    RewriteWorkspaces().erase(found);
++  }
++  if (!snapshot || !RestoreRewriteWorkspace(impl_->file_path, *snapshot)) {
++    LOG(ERROR) << "failed to roll back shared rewrite store '"
++               << impl_->file_path << "'.";
++    return false;
++  }
++  impl_->opened = false;
++  impl_->workspace.reset();
++  impl_->snapshot = StoreSnapshot{};
++  impl_->write_end = kStoreDataOffset;
++  return true;
++}
++
++bool RewriteStoreWriter::HasStage(const RewriteStageId& stage_id) const {
++  if (!impl_->opened) {
++    return false;
++  }
++  const auto& snapshot = impl_->Snapshot();
++  return snapshot.stages.find(stage_id) != snapshot.stages.end();
++}
++
++bool RewriteStoreWriter::AppendStage(const RewriteStageId& stage_id,
++                                     RewriteStageData stage) {
++  if (!impl_->opened || stage_id.empty() || stage.entries.empty()) {
++    return false;
++  }
++  auto& snapshot = impl_->Snapshot();
++  uint64_t& write_end = impl_->WriteEnd();
++  if (HasStage(stage_id)) {
++    return true;
++  }
++
++  RewriteSectionData section;
++  section.name = "stage";
++  section.stage = std::move(stage);
++  vector<RewriteSectionData> sections;
++  sections.push_back(std::move(section));
++  const path payload_path = MakeTemporaryPath(impl_->file_path);
++  TemporaryFileGuard payload_guard(payload_path);
++  if (!RewritePackBuilder().Build(payload_path, sections)) {
++    return false;
++  }
++  vector<RewriteSectionData>().swap(sections);
++
++  std::error_code ec;
++  const uint64_t payload_size = std::filesystem::file_size(payload_path, ec);
++  if (ec || payload_size == 0) {
++    return false;
++  }
++
++  std::ifstream payload(static_cast<const std::filesystem::path&>(payload_path),
++                        std::ios::binary);
++  std::fstream store(
++      static_cast<const std::filesystem::path&>(impl_->file_path),
++      std::ios::binary | std::ios::in | std::ios::out);
++  if (!payload || !store) {
++    return false;
++  }
++
++  const uint64_t object_offset = AlignValue(write_end, 8);
++  store.seekp(static_cast<std::streamoff>(write_end));
++  WriteZeros(&store, static_cast<size_t>(object_offset - write_end));
++  WriteZeros(&store, kObjectHeaderSize);
++
++  uint64_t payload_hash = 1469598103934665603ULL;
++  std::array<char, 64 * 1024> buffer{};
++  uint64_t copied = 0;
++  while (payload) {
++    payload.read(buffer.data(), buffer.size());
++    const std::streamsize size = payload.gcount();
++    if (size > 0) {
++      store.write(buffer.data(), size);
++      payload_hash =
++          HashBytes(payload_hash, buffer.data(), static_cast<size_t>(size));
++      copied += static_cast<uint64_t>(size);
++    }
++  }
++  if (!payload.eof() || !store || copied != payload_size) {
++    return false;
++  }
++
++  const auto header =
++      SerializeObjectHeader(stage_id, payload_size, payload_hash);
++  store.seekp(static_cast<std::streamoff>(object_offset));
++  store.write(header.data(), header.size());
++  store.flush();
++  if (!store) {
++    return false;
++  }
++  store.close();
++
++  StageLocation location;
++  location.object_offset = object_offset;
++  location.object_size = kObjectHeaderSize + payload_size;
++  location.payload_offset = object_offset + kObjectHeaderSize;
++  location.payload_size = payload_size;
++  location.payload_hash = payload_hash;
++  snapshot.stages.emplace(stage_id, location);
++  write_end = object_offset + location.object_size;
++  if (impl_->workspace) {
++    impl_->workspace->dirty = true;
++  }
++  return true;
++}
++
++bool RewriteStoreWriter::CommitSchema(
++    const string& schema_id,
++    const vector<RewriteStageReference>& stages) {
++  if (!impl_->opened || schema_id.empty()) {
++    return false;
++  }
++
++  auto& snapshot = impl_->Snapshot();
++  uint64_t& write_end = impl_->WriteEnd();
++  std::unordered_set<string> names;
++  names.reserve(stages.size());
++  for (const auto& stage : stages) {
++    if (stage.name.empty() || stage.stage_id.empty() ||
++        snapshot.stages.find(stage.stage_id) == snapshot.stages.end() ||
++        !names.insert(stage.name).second) {
++      return false;
++    }
++  }
++
++  bool changed = false;
++  const auto current = snapshot.schemas.find(schema_id);
++  if (stages.empty()) {
++    if (current != snapshot.schemas.end()) {
++      snapshot.schemas.erase(current);
++      changed = true;
++    }
++  } else if (current == snapshot.schemas.end() ||
++             current->second.size() != stages.size()) {
++    snapshot.schemas[schema_id] = stages;
++    changed = true;
++  } else {
++    for (size_t i = 0; i < stages.size(); ++i) {
++      if (current->second[i].name != stages[i].name ||
++          current->second[i].stage_id != stages[i].stage_id) {
++        snapshot.schemas[schema_id] = stages;
++        changed = true;
++        break;
++      }
++    }
++  }
++
++  if (impl_->workspace) {
++    if (changed) {
++      impl_->workspace->dirty = true;
++    }
++    return true;
++  }
++
++  if (!changed && write_end == snapshot.committed_size) {
++    return true;
++  }
++  return AppendIndexSnapshot(impl_->file_path, &snapshot, &write_end);
++}
++
++bool RewriteStoreWriter::RetainSchemas(const vector<string>& schema_ids) {
++  if (!impl_->opened) {
++    return false;
++  }
++  auto& snapshot = impl_->Snapshot();
++  uint64_t& write_end = impl_->WriteEnd();
++  std::unordered_set<string> live(schema_ids.begin(), schema_ids.end());
++  bool changed = false;
++  for (auto it = snapshot.schemas.begin(); it != snapshot.schemas.end();) {
++    if (live.find(it->first) == live.end()) {
++      it = snapshot.schemas.erase(it);
++      changed = true;
++    } else {
++      ++it;
++    }
++  }
++  if (impl_->workspace) {
++    if (changed) {
++      impl_->workspace->dirty = true;
++    }
++    return true;
++  }
++  if (!changed) {
++    return true;
++  }
++  return AppendIndexSnapshot(impl_->file_path, &snapshot, &write_end);
++}
++
++bool RewriteStoreWriter::Compact() {
++  if (!impl_->opened) {
++    return false;
++  }
++  if (impl_->workspace && !impl_->workspace->dirty) {
++    const bool remove_store =
++        !impl_->workspace->had_file || impl_->Snapshot().schemas.empty();
++    FinishRewriteWorkspace(impl_->file_path);
++    impl_->workspace.reset();
++    impl_->opened = false;
++    impl_->snapshot = StoreSnapshot{};
++    impl_->write_end = kStoreDataOffset;
++    if (remove_store) {
++      std::error_code ec;
++      std::filesystem::remove(impl_->file_path, ec);
++      if (ec) {
++        LOG(ERROR) << "cannot remove empty shared rewrite store '"
++                   << impl_->file_path << "': " << ec.message();
++        return false;
++      }
++    }
++    return true;
++  }
++  auto& snapshot = impl_->Snapshot();
++  if (snapshot.schemas.empty()) {
++    std::error_code ec;
++    std::filesystem::remove(impl_->file_path, ec);
++    if (ec) {
++      LOG(ERROR) << "cannot remove empty shared rewrite store '"
++                 << impl_->file_path << "': " << ec.message();
++      return false;
++    }
++    FinishRewriteWorkspace(impl_->file_path);
++    impl_->workspace.reset();
++    impl_->opened = false;
++    impl_->snapshot = StoreSnapshot{};
++    impl_->write_end = kStoreDataOffset;
++    return true;
++  }
++
++  std::unordered_set<RewriteStageId, RewriteStageIdHash> live_ids;
++  for (const auto& schema : snapshot.schemas) {
++    for (const auto& section : schema.second) {
++      live_ids.insert(section.stage_id);
++    }
++  }
++
++  for (const auto& id : live_ids) {
++    if (snapshot.stages.find(id) == snapshot.stages.end()) {
++      return false;
++    }
++  }
++
++  const path temporary_path = MakeTemporaryPath(impl_->file_path);
++  TemporaryFileGuard temporary_file(temporary_path);
++  if (!InitializeStoreFile(temporary_path)) {
++    return false;
++  }
++
++  std::ifstream source(
++      static_cast<const std::filesystem::path&>(impl_->file_path),
++      std::ios::binary);
++  std::fstream target(static_cast<const std::filesystem::path&>(temporary_path),
++                      std::ios::binary | std::ios::in | std::ios::out);
++  if (!source || !target) {
++    return false;
++  }
++
++  StoreSnapshot compacted;
++  compacted.generation = snapshot.generation;
++  compacted.committed_size = kStoreDataOffset;
++  compacted.schemas = snapshot.schemas;
++  uint64_t write_end = kStoreDataOffset;
++
++  vector<RewriteStageId> ordered_ids(live_ids.begin(), live_ids.end());
++  std::sort(ordered_ids.begin(), ordered_ids.end(), StageIdLess);
++  std::array<char, 64 * 1024> buffer{};
++  for (const auto& id : ordered_ids) {
++    const StageLocation& old_location = snapshot.stages.at(id);
++    StageLocation checked;
++    if (!ReadObjectHeader(&source, old_location.object_offset,
++                          impl_->WriteEnd(), &id, &checked) ||
++        checked.object_size != old_location.object_size) {
++      return false;
++    }
++
++    const uint64_t new_offset = AlignValue(write_end, 8);
++    target.seekp(static_cast<std::streamoff>(write_end));
++    WriteZeros(&target, static_cast<size_t>(new_offset - write_end));
++    source.clear();
++    source.seekg(static_cast<std::streamoff>(old_location.object_offset));
++
++    uint64_t remaining = old_location.object_size;
++    uint64_t copied = 0;
++    uint64_t payload_hash = 1469598103934665603ULL;
++    while (remaining > 0) {
++      const size_t chunk =
++          static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
++      source.read(buffer.data(), static_cast<std::streamsize>(chunk));
++      if (!source) {
++        return false;
++      }
++      target.write(buffer.data(), static_cast<std::streamsize>(chunk));
++      if (!target) {
++        return false;
++      }
++      const uint64_t chunk_begin = copied;
++      const uint64_t chunk_end = copied + chunk;
++      if (chunk_end > kObjectHeaderSize) {
++        const size_t hash_begin = static_cast<size_t>(
++            chunk_begin < kObjectHeaderSize ? kObjectHeaderSize - chunk_begin
++                                            : 0);
++        payload_hash = HashBytes(payload_hash, buffer.data() + hash_begin,
++                                 chunk - hash_begin);
++      }
++      copied += chunk;
++      remaining -= chunk;
++    }
++    if (payload_hash != checked.payload_hash) {
++      LOG(ERROR) << "cannot compact shared rewrite stage " << StageIdString(id)
++                 << ": payload checksum mismatch.";
++      return false;
++    }
++
++    StageLocation location = checked;
++    location.object_offset = new_offset;
++    location.payload_offset = new_offset + kObjectHeaderSize;
++    compacted.stages.emplace(id, location);
++    write_end = new_offset + location.object_size;
++  }
++  target.flush();
++  target.close();
++  source.close();
++  if (!FlushFileDurably(temporary_path) ||
++      !AppendIndexSnapshot(temporary_path, &compacted, &write_end)) {
++    return false;
++  }
++  StoreSuperblock committed_block;
++  committed_block.generation = compacted.generation;
++  committed_block.index_offset = compacted.index_offset;
++  committed_block.index_size = compacted.index_size;
++  committed_block.committed_size = compacted.committed_size;
++  committed_block.index_hash = compacted.index_hash;
++  const uint64_t mirror_slot = (compacted.generation + 1) % kSuperblockCount;
++  if (!WriteSuperblock(temporary_path, mirror_slot, committed_block)) {
++    return false;
++  }
++
++  std::error_code ec;
++  if (!InstallAtomically(temporary_path, impl_->file_path, &ec)) {
++    LOG(ERROR) << "cannot compact shared rewrite store '" << impl_->file_path
++               << "': " << ec.message();
++    return false;
++  }
++  temporary_file.Commit();
++  FinishRewriteWorkspace(impl_->file_path);
++  impl_->workspace.reset();
++  impl_->snapshot = std::move(compacted);
++  impl_->write_end = impl_->snapshot.committed_size;
++  return true;
++}
++
++}  // namespace rime
+diff --git a/src/rime/dict/rewrite_store.h b/src/rime/dict/rewrite_store.h
+new file mode 100644
+index 0000000..c15ec70
+--- /dev/null
++++ b/src/rime/dict/rewrite_store.h
+@@ -0,0 +1,83 @@
++//
++// Copyright RIME Developers
++// Distributed under the BSD License
++//
++#ifndef RIME_REWRITE_STORE_H_
++#define RIME_REWRITE_STORE_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <rime_api.h>
++#include <rime/common.h>
++#include <rime/dict/rewrite_pack.h>
++
++namespace rime {
++
++struct RewriteStageId {
++  uint64_t high = 0;
++  uint64_t low = 0;
++
++  bool empty() const { return high == 0 && low == 0; }
++  bool operator==(const RewriteStageId& other) const {
++    return high == other.high && low == other.low;
++  }
++  bool operator!=(const RewriteStageId& other) const {
++    return !(*this == other);
++  }
++};
++
++struct RewriteStageReference {
++  string name;
++  RewriteStageId stage_id;
++};
++
++class RIME_DLL RewriteStore {
++ public:
++  ~RewriteStore();
++
++  static std::shared_ptr<RewriteStore> OpenCached(const path& file_path);
++
++  bool FindStageId(const string& schema_id,
++                   const string& section_name,
++                   RewriteStageId* stage_id) const;
++  std::shared_ptr<const RewritePack> OpenStage(
++      const RewriteStageId& stage_id) const;
++  uint64_t generation() const { return generation_; }
++
++ private:
++  class Impl;
++
++  explicit RewriteStore(const path& file_path);
++  bool Open();
++
++  path file_path_;
++  uint64_t generation_ = 0;
++  std::unique_ptr<Impl> impl_;
++};
++
++class RIME_DLL RewriteStoreWriter {
++ public:
++  explicit RewriteStoreWriter(const path& file_path);
++  ~RewriteStoreWriter();
++
++  bool Open();
++  bool BeginWorkspace();
++  bool AbortWorkspace();
++  bool HasStage(const RewriteStageId& stage_id) const;
++  bool AppendStage(const RewriteStageId& stage_id, RewriteStageData stage);
++  bool CommitSchema(const string& schema_id,
++                    const vector<RewriteStageReference>& stages);
++  bool RetainSchemas(const vector<string>& schema_ids);
++  bool Compact();
++
++ private:
++  class Impl;
++  std::unique_ptr<Impl> impl_;
++};
++
++}  // namespace rime
++
++#endif  // RIME_REWRITE_STORE_H_
 diff --git a/src/rime/gear/gears_module.cc b/src/rime/gear/gears_module.cc
 index 4aa5d1d..ab77c58 100644
 --- a/src/rime/gear/gears_module.cc
@@ -1725,10 +3212,10 @@ index 4aa5d1d..ab77c58 100644
    if (!r.Find("charset_filter")) {  // allow improved implementation
 diff --git a/src/rime/gear/rewriter.cc b/src/rime/gear/rewriter.cc
 new file mode 100644
-index 0000000..3d94669
+index 0000000..48e0b42
 --- /dev/null
 +++ b/src/rime/gear/rewriter.cc
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,550 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -1737,6 +3224,8 @@ index 0000000..3d94669
 +
 +#include <algorithm>
 +#include <deque>
++#include <mutex>
++#include <set>
 +
 +#include <rime/candidate.h>
 +#include <rime/composition.h>
@@ -1783,11 +3272,21 @@ index 0000000..3d94669
 +  }
 +}
 +
-+path ResolvePackPath(const string& schema_id) {
++std::mutex& RewriterRegistryMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++std::set<Rewriter*>& RewriterRegistry() {
++  static std::set<Rewriter*> registry;
++  return registry;
++}
++
++path ResolveStorePath() {
 +  the<ResourceResolver> resolver(
 +      Service::instance().CreateDeployedResourceResolver(
 +          {"rewrite_pack", "", ".rwp"}));
-+  return resolver ? resolver->ResolvePath(schema_id) : path();
++  return resolver ? resolver->ResolvePath("rewriter") : path();
 +}
 +
 +}  // namespace
@@ -1981,32 +3480,31 @@ index 0000000..3d94669
 +  }
 +  LoadConfig();
 +
-+  if (!engine_ || !engine_->schema()) {
-+    return;
++  if (engine_ && engine_->schema()) {
++    schema_id_ = engine_->schema()->schema_id();
++    store_path_ = ResolveStorePath();
 +  }
-+  const path pack_path = ResolvePackPath(engine_->schema()->schema_id());
-+  if (pack_path.empty()) {
-+    LOG(WARNING) << "rewriter@" << name_space_ << " is disabled: rewrite pack "
-+                 << "for schema '" << engine_->schema()->schema_id()
-+                 << "' was not found; redeploy the schema to build it.";
-+    return;
-+  }
-+  pack_ = RewritePack::OpenCached(pack_path);
-+  if (!pack_) {
-+    return;
-+  }
-+  // Bind once; every subsequent query goes directly to this stage's view.
-+  stage_ = pack_->FindSection(name_space_);
-+  if (!stage_) {
-+    LOG(WARNING) << "rewriter@" << name_space_
-+                 << " is disabled: matching section was not found in rewrite "
-+                    "pack '"
-+                 << pack_path << "'; check engine/filters and rewriter@"
-+                 << name_space_ << " configuration, then redeploy.";
-+  }
++  std::lock_guard<std::mutex> lock(RewriterRegistryMutex());
++  RewriterRegistry().insert(this);
 +}
 +
-+Rewriter::~Rewriter() = default;
++Rewriter::~Rewriter() {
++  std::lock_guard<std::mutex> lock(RewriterRegistryMutex());
++  RewriterRegistry().erase(this);
++}
++
++void Rewriter::ReleaseStagesForDeployment() {
++  std::lock_guard<std::mutex> lock(RewriterRegistryMutex());
++  for (Rewriter* rewriter : RewriterRegistry()) {
++    if (!rewriter) {
++      continue;
++    }
++    rewriter->stage_ = nullptr;
++    rewriter->pack_.reset();
++    rewriter->store_.reset();
++    rewriter->stage_load_attempted_ = false;
++  }
++}
 +
 +void Rewriter::LoadConfig() {
 +  if (!engine_ || !engine_->schema() || !engine_->schema()->config()) {
@@ -2102,6 +3600,47 @@ index 0000000..3d94669
 +    }
 +  }
 +  return false;
++}
++
++bool Rewriter::EnsureStage() {
++  if (stage_) {
++    return true;
++  }
++  if (stage_load_attempted_ || schema_id_.empty() || store_path_.empty()) {
++    return false;
++  }
++  stage_load_attempted_ = true;
++
++  store_ = RewriteStore::OpenCached(store_path_);
++  if (!store_) {
++    LOG(WARNING) << "rewriter@" << name_space_
++                 << " is disabled: shared rewrite store '" << store_path_
++                 << "' could not be opened; redeploy the workspace.";
++    return false;
++  }
++
++  RewriteStageId stage_id;
++  if (!store_->FindStageId(schema_id_, name_space_, &stage_id)) {
++    LOG(WARNING) << "rewriter@" << name_space_ << " is disabled: schema '"
++                 << schema_id_
++                 << "' has no matching stage in shared rewrite store '"
++                 << store_path_ << "'; redeploy the workspace.";
++    return false;
++  }
++
++  pack_ = store_->OpenStage(stage_id);
++  if (!pack_) {
++    return false;
++  }
++  stage_ = pack_->FindSection("stage");
++  if (!stage_) {
++    LOG(WARNING) << "rewriter@" << name_space_
++                 << " is disabled: shared rewrite stage is malformed; "
++                    "redeploy the workspace.";
++    pack_.reset();
++    return false;
++  }
++  return true;
 +}
 +
 +bool Rewriter::Rewrite(std::string_view text, vector<string>* values) const {
@@ -2209,16 +3748,19 @@ index 0000000..3d94669
 +  const size_t segment_end = segment_end_;
 +  has_segment_range_ = false;
 +
-+  if (!translation || !stage_ || !Active()) {
++  if (!translation || !Active()) {
 +    return translation;
 +  }
 +  if (options_.mode == Mode::kAbbrev) {
 +    Context* context = engine_ ? engine_->context() : nullptr;
-+    if (!context || !has_segment_range) {
++    if (!context || !has_segment_range || !EnsureStage()) {
 +      return translation;
 +    }
 +    return New<RewriterAbbrevTranslation>(translation, this, context,
 +                                          segment_start, segment_end);
++  }
++  if (!EnsureStage()) {
++    return translation;
 +  }
 +  return New<RewriterTranslation>(translation, this);
 +}
@@ -2226,10 +3768,10 @@ index 0000000..3d94669
 +}  // namespace rime
 diff --git a/src/rime/gear/rewriter.h b/src/rime/gear/rewriter.h
 new file mode 100644
-index 0000000..9063ddf
+index 0000000..caca70a
 --- /dev/null
 +++ b/src/rime/gear/rewriter.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,88 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2244,7 +3786,7 @@ index 0000000..9063ddf
 +#include <vector>
 +
 +#include <rime/filter.h>
-+#include <rime/dict/rewrite_pack.h>
++#include <rime/dict/rewrite_store.h>
 +#include <rime/gear/filter_commons.h>
 +
 +namespace rime {
@@ -2260,6 +3802,10 @@ index 0000000..9063ddf
 +  an<Translation> Apply(an<Translation> translation,
 +                        CandidateList* candidates) override;
 +  bool AppliesToSegment(Segment* segment) override;
++
++  // Maintenance-mode deployment drops all Rewriter-owned mappings while
++  // keeping sessions alive. Rewriters reopen lazily after deployment.
++  static void ReleaseStagesForDeployment();
 +
 + private:
 +  friend class RewriterTranslation;
@@ -2285,6 +3831,7 @@ index 0000000..9063ddf
 +
 +  void LoadConfig();
 +  bool Active() const;
++  bool EnsureStage();
 +  bool Rewrite(std::string_view text, vector<string>* values) const;
 +  bool Transform(const an<Candidate>& candidate, CandidateQueue* result) const;
 +  const string& CandidateType(const an<Candidate>& candidate) const;
@@ -2292,9 +3839,12 @@ index 0000000..9063ddf
 +  string ApplyCommentTemplate(const string& value) const;
 +
 +  Options options_;
-+  // Retain the mapping for stage_, including while a new pack is deployed.
++  string schema_id_;
++  path store_path_;
++  std::shared_ptr<const RewriteStore> store_;
 +  std::shared_ptr<const RewritePack> pack_;
 +  RewritePack::StageHandle stage_ = nullptr;
++  bool stage_load_attempted_ = false;
 +  size_t segment_start_ = 0;
 +  size_t segment_end_ = 0;
 +  bool has_segment_range_ = false;
@@ -2311,42 +3861,137 @@ index 0000000..9063ddf
 +
 +#endif  // RIME_REWRITER_H_
 diff --git a/src/rime/lever/deployment_tasks.cc b/src/rime/lever/deployment_tasks.cc
-index a51fe9f..89f49ec 100644
+index a51fe9f..7cbe339 100644
 --- a/src/rime/lever/deployment_tasks.cc
 +++ b/src/rime/lever/deployment_tasks.cc
-@@ -26,6 +26,7 @@
+@@ -25,7 +25,9 @@
+ #include <rime/algo/utilities.h>
  #include <rime/dict/dictionary.h>
  #include <rime/dict/dict_compiler.h>
++#include <rime/gear/rewriter.h>
  #include <rime/lever/deployment_tasks.h>
 +#include <rime/lever/rewrite_compiler.h>
  #include <rime/lever/user_dict_manager.h>
  #ifdef _WIN32
  #include <windows.h>
-@@ -564,6 +565,18 @@ bool SchemaUpdate::Run(Deployer* deployer) {
+@@ -251,6 +253,9 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+     return false;
+   }
+ 
++  const bool rewrite_workspace_started =
++      RewriteCompiler::BeginWorkspace(deployer);
++
+   LOG(INFO) << "updating schemas.";
+   int success = 0;
+   int failure = 0;
+@@ -258,6 +263,22 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+   the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
+       {"schema_source_file", "", ".schema.yaml"}));
+   auto schema_component = Config::Require("schema");
++  vector<string> active_schema_ids;
++
++  // Compile this schema's rewriter sections into the shared rewrite store.
++  // Upstream does this inside SchemaUpdate::Run, but the parallel deployment
++  // path below updates schema configs and compiles dictionaries itself and
++  // never runs SchemaUpdate, so it must be invoked here. Runs in the serial
++  // phase, matching upstream's ordering; a failure only warns (the schema is
++  // still usable without rewrite data).
++  auto compile_rewriter = [&](const string& schema_id) {
++    the<Config> rewrite_config(Config::Require("schema")->Create(schema_id));
++    RewriteCompiler rewrite_compiler(schema_id, rewrite_config.get(), deployer);
++    if (!rewrite_compiler.Compile()) {
++      LOG(WARNING) << "rewrite data for schema '" << schema_id
++                   << "' was not updated.";
++    }
++  };
+ 
+   // Phase 1 (serial): update schema config files, resolve the dictionaries to
+   // compile, and collect them into compile units. All accesses to the shared,
+@@ -268,6 +289,7 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+       [&](const string& schema_id, bool as_dependency) {
+         if (schemas.find(schema_id) != schemas.end())  // already processed
+           return;
++        active_schema_ids.push_back(schema_id);
+         LOG(INFO) << "schema: " << schema_id;
+         path schema_path = resolver->ResolvePath(schema_id);
+         schemas[schema_id] = schema_path;
+@@ -293,6 +315,12 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+           ++failure;
+           return;
+         }
++        // upstream compiles the rewriter sections inside SchemaUpdate::Run,
++        // which this path replaces; compile them here instead. This covers
++        // both branches below (with and without a dictionary), matching
++        // upstream. Runs in the serial phase, so the shared rewrite store is
++        // never written concurrently.
++        compile_rewriter(schema_id);
+         string dict_name;
+         if (!schema_config->GetString("translator/dictionary", &dict_name)) {
+           ++success;  // not requiring a dictionary
+@@ -352,6 +380,11 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+   // dictionary, or a dictionary that is another schema's pack) are compiled
+   // serially; independent units may be compiled in parallel.
+   if (!MaybeCreateDirectory(deployer->staging_dir)) {
++    // leaving the rewrite workspace transaction open would make every later
++    // deployment in this process fail with "transaction already active"
++    if (rewrite_workspace_started) {
++      RewriteCompiler::AbortWorkspace(deployer);
++    }
+     return false;
+   }
+   map<string, vector<size_t>> artifact_owners;
+@@ -475,6 +508,16 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+       ++failure;
+   }
+ #endif
++  if (rewrite_workspace_started) {
++    Rewriter::ReleaseStagesForDeployment();
++    if (!RewriteCompiler::FinalizeWorkspace(active_schema_ids, deployer)) {
++      LOG(WARNING) << "failed to finalize shared rewrite store.";
++      if (!RewriteCompiler::AbortWorkspace(deployer)) {
++        LOG(WARNING) << "failed to roll back shared rewrite store.";
++      }
++    }
++  }
++
+   LOG(INFO) << "finished updating schemas: " << success << " success, "
+             << failure << " failure.";
+ 
+@@ -564,9 +607,20 @@ bool SchemaUpdate::Run(Deployer* deployer) {
    }
    // reload compiled config
    config.reset(Config::Require("schema")->Create(schema_id));
 +
-+  // Rewrite compilation is additive. Reuse the already loaded config so the
-+  // existing dictionary deployment path below remains unchanged.
-+  {
-+    RewriteCompiler rewrite_compiler(schema_id, config.get(), deployer);
++  auto compile_rewriter = [&]() {
++    the<Config> rewrite_config(Config::Require("schema")->Create(schema_id));
++    RewriteCompiler rewrite_compiler(schema_id, rewrite_config.get(), deployer);
 +    if (!rewrite_compiler.Compile()) {
-+      LOG(ERROR) << "rewrite pack for schema '" << schema_id
-+                 << "' failed to compile.";
-+      return false;
++      LOG(WARNING) << "rewrite data for schema '" << schema_id
++                   << "' was not updated.";
 +    }
-+  }
++  };
 +
    string dict_name;
    if (!config->GetString("translator/dictionary", &dict_name)) {
      // not requiring a dictionary
++    compile_rewriter();
+     return true;
+   }
+   Schema schema(schema_id, config.release());
+@@ -591,6 +645,7 @@ bool SchemaUpdate::Run(Deployer* deployer) {
+     return false;
+   }
+   LOG(INFO) << "dictionary '" << dict_name << "' is ready.";
++  compile_rewriter();
+   return true;
+ }
+ 
 diff --git a/src/rime/lever/rewrite_compiler.cc b/src/rime/lever/rewrite_compiler.cc
 new file mode 100644
-index 0000000..9f4ae17
+index 0000000..f37d5f5
 --- /dev/null
 +++ b/src/rime/lever/rewrite_compiler.cc
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,645 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2358,6 +4003,7 @@ index 0000000..9f4ae17
 +#include <rime/lever/rewrite_compiler.h>
 +
 +#include <algorithm>
++#include <array>
 +#include <cstdint>
 +#include <filesystem>
 +#include <fstream>
@@ -2367,10 +4013,9 @@ index 0000000..9f4ae17
 +#include <utility>
 +
 +#include <rime/algo/algebra.h>
-+#include <rime/algo/utilities.h>
 +#include <rime/config.h>
 +#include <rime/deployer.h>
-+#include <rime/dict/rewrite_pack.h>
++#include <rime/dict/rewrite_store.h>
 +
 +namespace rime {
 +
@@ -2380,28 +4025,8 @@ index 0000000..9f4ae17
 +constexpr size_t kMaxSourceLineBytes = 16 * 1024 * 1024;
 +constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
 +constexpr uint64_t kFnvPrime = 1099511628211ULL;
-+constexpr uint64_t kSourceChecksumContractVersion = 2;
-+
-+uint64_t HashBytes(uint64_t hash, const char* data, size_t size) {
-+  for (size_t i = 0; i < size; ++i) {
-+    hash ^= static_cast<unsigned char>(data[i]);
-+    hash *= kFnvPrime;
-+  }
-+  return hash;
-+}
-+
-+uint64_t HashU64(uint64_t hash, uint64_t value) {
-+  char bytes[8];
-+  for (size_t i = 0; i < sizeof(bytes); ++i) {
-+    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
-+  }
-+  return HashBytes(hash, bytes, sizeof(bytes));
-+}
-+
-+uint64_t HashString(uint64_t hash, const string& value) {
-+  hash = HashU64(hash, value.size());
-+  return HashBytes(hash, value.data(), value.size());
-+}
++constexpr uint64_t kStageFingerprintContractVersion = 1;
++constexpr uint64_t kSecondHashSeed = 0x9e3779b97f4a7c15ULL;
 +
 +bool StartsWith(const string& text, const string& prefix) {
 +  return text.size() >= prefix.size() &&
@@ -2605,46 +4230,103 @@ index 0000000..9f4ae17
 +  return true;
 +}
 +
-+bool ComputeSourceChecksum(const vector<RewriteSourceSection>& sources,
-+                           uint64_t* checksum) {
-+  if (!checksum) {
++void HashBytes(RewriteStageId* id, const char* data, size_t size) {
++  if (!id) {
++    return;
++  }
++  for (size_t i = 0; i < size; ++i) {
++    const uint64_t byte = static_cast<unsigned char>(data[i]);
++    id->high ^= byte;
++    id->high *= kFnvPrime;
++    id->low ^= byte + kSecondHashSeed + (id->low << 6) + (id->low >> 2);
++    id->low *= 0x9ddfea08eb382d69ULL;
++  }
++}
++
++void HashU64(RewriteStageId* id, uint64_t value) {
++  char bytes[8];
++  for (size_t i = 0; i < sizeof(bytes); ++i) {
++    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xff);
++  }
++  HashBytes(id, bytes, sizeof(bytes));
++}
++
++void HashString(RewriteStageId* id, const string& value) {
++  HashU64(id, value.size());
++  HashBytes(id, value.data(), value.size());
++}
++
++bool ComputeStageId(const RewriteSourceSection& source,
++                    RewriteStageId* stage_id) {
++  if (!stage_id) {
 +    return false;
 +  }
 +
-+  uint64_t hash = kFnvOffsetBasis;
-+  hash = HashU64(hash, kSourceChecksumContractVersion);
-+  hash = HashU64(hash, sources.size());
-+  for (const auto& section : sources) {
-+    hash = HashString(hash, section.name);
-+    hash = HashString(hash, section.key_xlit);
-+    // One section currently equals one pipeline stage.
-+    hash = HashU64(hash, 1);
-+    hash = HashU64(hash, section.files.size());
-+    for (const auto& file : section.files) {
-+      std::error_code ec;
-+      const uint64_t file_size = fs::file_size(file.resolved_path, ec);
-+      if (ec) {
-+        LOG(ERROR) << "rewriter@" << section.name
-+                   << " cannot read metadata for source '" << file.resolved_path
-+                   << "': " << ec.message()
-+                   << "; check that the file still exists and is readable.";
-+        return false;
++  RewriteStageId id{kFnvOffsetBasis, kSecondHashSeed};
++  HashU64(&id, kStageFingerprintContractVersion);
++  HashString(&id, source.key_xlit);
++
++  std::unordered_set<std::filesystem::path> seen_files;
++  seen_files.reserve(source.files.size());
++  uint64_t unique_file_count = 0;
++  for (const auto& file : source.files) {
++    const auto& identity =
++        static_cast<const std::filesystem::path&>(file.resolved_path);
++    if (seen_files.insert(identity).second) {
++      ++unique_file_count;
++    }
++  }
++  HashU64(&id, unique_file_count);
++  seen_files.clear();
++
++  for (const auto& file : source.files) {
++    const auto& identity =
++        static_cast<const std::filesystem::path&>(file.resolved_path);
++    if (!seen_files.insert(identity).second) {
++      continue;
++    }
++    std::error_code ec;
++    const uint64_t file_size = fs::file_size(file.resolved_path, ec);
++    if (ec) {
++      LOG(ERROR) << "rewriter@" << source.name
++                 << " cannot read metadata for source '" << file.resolved_path
++                 << "': " << ec.message()
++                 << "; check that the file still exists and is readable.";
++      return false;
++    }
++
++    // Stage identity follows ordered source bytes and key_xlit semantics.
++    HashU64(&id, file_size);
++    std::ifstream in(
++        static_cast<const std::filesystem::path&>(file.resolved_path),
++        std::ios::binary);
++    if (!in) {
++      LOG(ERROR) << "rewriter@" << source.name << " cannot open source '"
++                 << file.resolved_path
++                 << "' while computing its shared-stage id.";
++      return false;
++    }
++
++    std::array<char, 64 * 1024> buffer{};
++    while (in) {
++      in.read(buffer.data(), buffer.size());
++      const std::streamsize size = in.gcount();
++      if (size > 0) {
++        HashBytes(&id, buffer.data(), static_cast<size_t>(size));
 +      }
-+
-+      // Reuse librime's streaming CRC32 implementation for source bytes. The
-+      // outer FNV framing adds section names, file names, lengths and ordering,
-+      // so A+BC cannot alias AB+C merely because the concatenated bytes match.
-+      ChecksumComputer cc;
-+      cc.ProcessFile(file.resolved_path);
-+      const uint32_t file_checksum = cc.Checksum();
-+
-+      hash = HashString(hash, file.declared_name);
-+      hash = HashU64(hash, file_size);
-+      hash = HashU64(hash, file_checksum);
++    }
++    if (!in.eof()) {
++      LOG(ERROR) << "rewriter@" << source.name
++                 << " encountered an I/O error while hashing source '"
++                 << file.resolved_path << "'.";
++      return false;
 +    }
 +  }
 +
-+  *checksum = hash;
++  if (id.empty()) {
++    id.low = 1;
++  }
++  *stage_id = id;
 +  return true;
 +}
 +
@@ -2806,7 +4488,7 @@ index 0000000..9f4ae17
 +    return false;
 +  }
 +
-+  output->name = source.name;
++  output->name = "stage";
 +  output->stage.entries.clear();
 +
 +  Projection key_xlit_projection;
@@ -2863,18 +4545,31 @@ index 0000000..9f4ae17
 +  if (schema_id_.empty() || schema_id_path.is_absolute() ||
 +      schema_id_path.has_parent_path() ||
 +      schema_id_path.filename().string() != schema_id_) {
-+    LOG(ERROR) << "cannot build rewrite pack: schema id '" << schema_id_
++    LOG(ERROR) << "cannot update shared rewrite store: schema id '"
++               << schema_id_
 +               << "' is invalid; expected a single non-empty schema id "
 +                  "without path components.";
 +    return false;
 +  }
-+  const vector<string> section_names = FindRewriterSections(config_);
-+  const path output_path = deployer_->staging_dir / (schema_id_ + ".rwp");
 +
++  std::error_code ec;
++  fs::create_directories(deployer_->staging_dir, ec);
++  if (ec) {
++    LOG(ERROR) << "cannot create rewrite staging directory '"
++               << deployer_->staging_dir << "': " << ec.message()
++               << "; check directory permissions and available storage.";
++    return false;
++  }
++
++  const path store_path = deployer_->staging_dir / "rewriter.rwp";
++  RewriteStoreWriter store(store_path);
++  if (!store.Open()) {
++    return false;
++  }
++
++  const vector<string> section_names = FindRewriterSections(config_);
 +  if (section_names.empty()) {
-+    // No rewriter means no deployment side effect. A stale pack is inert
-+    // because no Rewriter component will be constructed for this schema.
-+    return true;
++    return store.CommitSchema(schema_id_, {});
 +  }
 +
 +  vector<RewriteSourceSection> sources;
@@ -2882,52 +4577,72 @@ index 0000000..9f4ae17
 +    return false;
 +  }
 +
-+  uint64_t source_checksum = 0;
-+  if (!ComputeSourceChecksum(sources, &source_checksum)) {
-+    return false;
-+  }
-+  if (RewritePackBuilder::IsUpToDate(output_path, source_checksum)) {
-+    LOG(INFO) << "rewrite pack is up-to-date: " << output_path;
-+    return true;
-+  }
-+
-+  vector<RewriteSectionData> sections;
-+  sections.reserve(sources.size());
++  vector<RewriteStageReference> references;
++  references.reserve(sources.size());
 +  for (const auto& source : sources) {
-+    RewriteSectionData section;
-+    if (!CompileSection(source, &section)) {
++    RewriteStageId stage_id;
++    if (!ComputeStageId(source, &stage_id)) {
 +      return false;
 +    }
-+    sections.push_back(std::move(section));
++
++    if (!store.HasStage(stage_id)) {
++      RewriteSectionData section;
++      if (!CompileSection(source, &section)) {
++        return false;
++      }
++      if (!store.AppendStage(stage_id, std::move(section.stage))) {
++        LOG(ERROR) << "failed to append shared rewrite stage for rewriter@"
++                   << source.name << ".";
++        return false;
++      }
++    }
++    references.push_back({source.name, stage_id});
 +  }
 +
-+  std::error_code ec;
-+  fs::create_directories(deployer_->staging_dir, ec);
-+  if (ec) {
-+    LOG(ERROR) << "cannot create rewrite pack staging directory '"
-+               << deployer_->staging_dir << "': " << ec.message()
-+               << "; check directory permissions and available storage.";
++  if (!store.CommitSchema(schema_id_, references)) {
++    LOG(ERROR) << "failed to commit rewrite index for schema '" << schema_id_
++               << "'.";
 +    return false;
 +  }
-+
-+  LOG(INFO) << "compiling rewrite pack '" << output_path << "'.";
-+  RewritePackBuilder builder;
-+  if (!builder.Build(output_path, sections, source_checksum)) {
-+    LOG(ERROR) << "rewrite pack build failed for '" << output_path
-+               << "'; see the preceding rewrite error for the root cause.";
-+    return false;
-+  }
-+  LOG(INFO) << "rewrite pack is ready: " << output_path;
 +  return true;
++}
++
++bool RewriteCompiler::BeginWorkspace(Deployer* deployer) {
++  if (!deployer) {
++    return false;
++  }
++  RewriteStoreWriter store(deployer->staging_dir / "rewriter.rwp");
++  return store.BeginWorkspace();
++}
++
++bool RewriteCompiler::AbortWorkspace(Deployer* deployer) {
++  if (!deployer) {
++    return false;
++  }
++  RewriteStoreWriter store(deployer->staging_dir / "rewriter.rwp");
++  return store.AbortWorkspace();
++}
++
++bool RewriteCompiler::FinalizeWorkspace(const vector<string>& schema_ids,
++                                        Deployer* deployer) {
++  if (!deployer) {
++    return false;
++  }
++  const path store_path = deployer->staging_dir / "rewriter.rwp";
++  RewriteStoreWriter store(store_path);
++  if (!store.Open() || !store.RetainSchemas(schema_ids)) {
++    return false;
++  }
++  return store.Compact();
 +}
 +
 +}  // namespace rime
 diff --git a/src/rime/lever/rewrite_compiler.h b/src/rime/lever/rewrite_compiler.h
 new file mode 100644
-index 0000000..6e4ff17
+index 0000000..d164b66
 --- /dev/null
 +++ b/src/rime/lever/rewrite_compiler.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,36 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2950,6 +4665,10 @@ index 0000000..6e4ff17
 +  RewriteCompiler(const string& schema_id, Config* config, Deployer* deployer);
 +
 +  bool Compile();
++  static bool BeginWorkspace(Deployer* deployer);
++  static bool AbortWorkspace(Deployer* deployer);
++  static bool FinalizeWorkspace(const vector<string>& schema_ids,
++                                Deployer* deployer);
 +
 + private:
 +  string schema_id_;
