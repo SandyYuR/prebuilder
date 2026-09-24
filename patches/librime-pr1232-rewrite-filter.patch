@@ -203,10 +203,10 @@ index 0000000..ff19299
 +#endif  // RIME_REWRITE_BINARY_H_
 diff --git a/src/rime/dict/rewrite_pack.cc b/src/rime/dict/rewrite_pack.cc
 new file mode 100644
-index 0000000..b82e7ab
+index 0000000..2b848f7
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.cc
-@@ -0,0 +1,1078 @@
+@@ -0,0 +1,1490 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -253,7 +253,12 @@ index 0000000..b82e7ab
 +constexpr uint32_t kHeaderSize = kStageRecordOffset + kStageRecordSize;
 +constexpr uint32_t kKeyIndexRecordSize = 8;
 +constexpr uint32_t kStageFlagHasPreedit = 1U << 0;
-+constexpr uint32_t kKnownStageFlags = kStageFlagHasPreedit;
++constexpr uint32_t kStageFeatureFlagsMask = 0xffU;
++constexpr uint32_t kKnownStageFeatureFlags = kStageFlagHasPreedit;
++
++// Bits above the feature byte were used by an experimental max-key-length
++// optimization. They are ignored on read for compatibility with those packs;
++// newly built stages leave them zero.
 +
 +constexpr uint32_t kUnicodeScalarLimit = 0x110000;
 +constexpr uint32_t kCharPageShift = 8;
@@ -330,6 +335,18 @@ index 0000000..b82e7ab
 +  return (unit >> 10) << ((unit & (1U << 9)) >> 6);
 +}
 +
++bool DartsUnitHasLeaf(uint32_t unit) {
++  return ((unit >> 8) & 1U) != 0;
++}
++
++uint32_t DartsUnitValue(uint32_t unit) {
++  return unit & ((1U << 31) - 1);
++}
++
++uint32_t StageFeatureFlags(uint32_t flags) {
++  return flags & kStageFeatureFlagsMask;
++}
++
 +bool ValidatePhraseTrieBounds(const char* data, uint64_t size) {
 +  constexpr uint64_t kDartsBlockUnits = 256;
 +  constexpr uint64_t kDartsUnitSize = sizeof(uint32_t);
@@ -365,7 +382,7 @@ index 0000000..b82e7ab
 +         record.char_page_count != 0 &&
 +         record.char_page_count <= kCharDirectoryEntries &&
 +         record.value_pool_size != 0 &&
-+         (record.flags & ~kKnownStageFlags) == 0 &&
++         (StageFeatureFlags(record.flags) & ~kKnownStageFeatureFlags) == 0 &&
 +         record.char_directory_offset >= kHeaderSize &&
 +         (record.char_directory_offset % alignof(uint16_t)) == 0 &&
 +         (record.char_pages_offset % alignof(uint32_t)) == 0 &&
@@ -435,6 +452,32 @@ index 0000000..b82e7ab
 +    return 4;
 +  }
 +  return 0;
++}
++
++size_t EncodeUtf8Scalar(uint32_t code_point, char out[5]) {
++  if (!out || code_point > 0x10ffff ||
++      (code_point >= 0xd800 && code_point <= 0xdfff)) {
++    return 0;
++  }
++
++  size_t size = 0;
++  if (code_point <= 0x7f) {
++    out[size++] = static_cast<char>(code_point);
++  } else if (code_point <= 0x7ff) {
++    out[size++] = static_cast<char>(0xc0 | (code_point >> 6));
++    out[size++] = static_cast<char>(0x80 | (code_point & 0x3f));
++  } else if (code_point <= 0xffff) {
++    out[size++] = static_cast<char>(0xe0 | (code_point >> 12));
++    out[size++] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3f));
++    out[size++] = static_cast<char>(0x80 | (code_point & 0x3f));
++  } else {
++    out[size++] = static_cast<char>(0xf0 | (code_point >> 18));
++    out[size++] = static_cast<char>(0x80 | ((code_point >> 12) & 0x3f));
++    out[size++] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3f));
++    out[size++] = static_cast<char>(0x80 | (code_point & 0x3f));
++  }
++  out[size] = '\0';
++  return size;
 +}
 +
 +bool ValidateUtf8Key(std::string_view key,
@@ -617,90 +660,193 @@ index 0000000..b82e7ab
 +  uint32_t key_count = 0;
 +  uint32_t phrase_key_count = 0;
 +  uint32_t flags = 0;
++  vector<uint32_t> phrase_nodes;
 +
-+  uint32_t Dispatch(uint32_t code_point) const {
++  size_t DispatchSlot(uint32_t code_point) const {
 +    if (!char_directory || !char_pages || code_point >= kUnicodeScalarLimit) {
-+      return 0;
++      return kInvalidIndex;
 +    }
 +    const uint16_t page_id = char_directory[code_point >> kCharPageShift];
 +    if (page_id == 0 || page_id > char_page_count) {
-+      return 0;
++      return kInvalidIndex;
 +    }
-+    const size_t page_offset = static_cast<size_t>(page_id - 1) * kCharPageSize;
-+    return char_pages[page_offset + (code_point & kCharPageMask)];
++    return static_cast<size_t>(page_id - 1) * kCharPageSize +
++           (code_point & kCharPageMask);
++  }
++
++  uint32_t Dispatch(uint32_t code_point) const {
++    const size_t slot = DispatchSlot(code_point);
++    return slot == kInvalidIndex ? 0 : char_pages[slot];
 +  }
 +
 +  uint32_t DispatchAt(const char* current,
 +                      const char* end,
-+                      size_t* char_size) const {
++                      size_t* char_size,
++                      size_t* dispatch_slot = nullptr) const {
 +    if (!char_size) {
 +      return 0;
 +    }
++    if (dispatch_slot) {
++      *dispatch_slot = kInvalidIndex;
++    }
++
 +    uint32_t code_point = 0;
 +    *char_size = DecodeUtf8Scalar(current, end, &code_point);
 +    if (*char_size == 0) {
 +      *char_size = 1;
 +      return 0;
 +    }
-+    return Dispatch(code_point);
++
++    const size_t slot = DispatchSlot(code_point);
++    if (dispatch_slot) {
++      *dispatch_slot = slot;
++    }
++    return slot == kInvalidIndex ? 0 : char_pages[slot];
 +  }
 +
-+  bool FindLongestPhrase(const char* current,
-+                         const char* end,
-+                         Darts::DoubleArray::result_pair_type* longest) const {
-+    if (!current || !end || !longest || current >= end ||
-+        phrase_key_count == 0) {
++  bool BuildPhraseNodeCache() {
++    phrase_nodes.clear();
++    if (phrase_key_count == 0) {
++      return true;
++    }
++    if (!char_directory || !char_pages) {
 +      return false;
 +    }
 +
-+    *longest = {};
-+    const size_t remaining = static_cast<size_t>(end - current);
-+    const size_t max_possible_results =
-+        std::min(remaining, static_cast<size_t>(phrase_key_count));
-+    if (max_possible_results == 0) {
++    phrase_nodes.assign(static_cast<size_t>(char_page_count) * kCharPageSize,
++                        0);
++
++    for (uint32_t high = 0; high < kCharDirectoryEntries; ++high) {
++      const uint16_t page_id = char_directory[high];
++      if (page_id == 0) {
++        continue;
++      }
++      if (page_id > char_page_count) {
++        return false;
++      }
++
++      const size_t page_offset =
++          static_cast<size_t>(page_id - 1) * kCharPageSize;
++      for (uint32_t low = 0; low < kCharPageSize; ++low) {
++        const size_t slot = page_offset + low;
++        if ((char_pages[slot] & kDispatchPhraseStarter) == 0) {
++          continue;
++        }
++
++        const uint32_t code_point = (high << kCharPageShift) | low;
++        char encoded[5] = {};
++        const size_t encoded_size = EncodeUtf8Scalar(code_point, encoded);
++        if (encoded_size == 0) {
++          return false;
++        }
++
++        size_t node_pos = 0;
++        size_t key_pos = 0;
++        phrase_trie.traverse(encoded, node_pos, key_pos);
++        if (key_pos != encoded_size ||
++            node_pos >= std::numeric_limits<uint32_t>::max()) {
++          return false;
++        }
++
++        // Zero means no phrase continuation.
++        phrase_nodes[slot] = static_cast<uint32_t>(node_pos + 1);
++      }
++    }
++    return true;
++  }
++
++  bool PhraseNode(size_t dispatch_slot, size_t* node_pos) const {
++    if (!node_pos || dispatch_slot == kInvalidIndex ||
++        dispatch_slot >= phrase_nodes.size()) {
++      return false;
++    }
++    const uint32_t encoded = phrase_nodes[dispatch_slot];
++    if (encoded == 0) {
++      return false;
++    }
++    *node_pos = static_cast<size_t>(encoded - 1);
++    return true;
++  }
++
++  struct PhraseProbe {
++    Darts::DoubleArray::result_pair_type longest{};
++    size_t required_prefix = 0;
++    size_t scanned_bytes = 0;
++    size_t consumed_suffix_bytes = 0;
++    size_t node_pos = 0;
++    bool append_sensitive = true;
++    bool stopped_by_mismatch = false;
++  };
++
++  bool ProbePhraseFromNode(
++      const char* suffix,
++      const char* end,
++      size_t node_pos,
++      size_t consumed_suffix_bytes,
++      const Darts::DoubleArray::result_pair_type& prior_longest,
++      PhraseProbe* probe) const {
++    if (!suffix || !end || !probe || suffix > end || phrase_key_count == 0) {
 +      return false;
 +    }
 +
-+    constexpr size_t kInlinePrefixResults = 8;
-+    std::array<Darts::DoubleArray::result_pair_type, kInlinePrefixResults>
-+        inline_results{};
++    *probe = {};
++    probe->longest = prior_longest;
++    probe->node_pos = node_pos;
++    probe->consumed_suffix_bytes = consumed_suffix_bytes;
 +
-+    auto select_longest = [&](const auto* results, size_t count) {
-+      for (size_t i = 0; i < count; ++i) {
-+        if (results[i].length > longest->length) {
-+          *longest = results[i];
++    const auto* units = static_cast<const uint32_t*>(phrase_trie.array());
++    if (!units) {
++      return false;
++    }
++
++    size_t id = node_pos;
++    uint32_t unit = units[id];
++    size_t base = id ^ DartsUnitOffset(unit);
++    const size_t remaining = static_cast<size_t>(end - suffix);
++
++    for (size_t i = 0; i < remaining; ++i) {
++      const uint32_t label = static_cast<unsigned char>(suffix[i]);
++      const size_t next = base ^ label;
++      const uint32_t next_unit = units[next];
++
++      if (DartsUnitLabel(next_unit) != label) {
++        probe->required_prefix = consumed_suffix_bytes + i + 1;
++        probe->scanned_bytes = i + 1;
++        probe->consumed_suffix_bytes = consumed_suffix_bytes + i;
++        probe->node_pos = id;
++        probe->append_sensitive = false;
++        probe->stopped_by_mismatch = true;
++        return true;
++      }
++
++      id = next;
++      unit = next_unit;
++      base = id ^ DartsUnitOffset(unit);
++      if (DartsUnitHasLeaf(unit)) {
++        const uint32_t value = DartsUnitValue(units[base]);
++        if (value != 0) {
++          probe->longest.value = static_cast<int>(value);
++          probe->longest.length = consumed_suffix_bytes + i + 1;
 +        }
 +      }
-+    };
-+
-+    size_t capacity = inline_results.size();
-+    size_t match_count = phrase_trie.commonPrefixSearch(
-+        current, inline_results.data(), capacity, remaining);
-+    select_longest(inline_results.data(), std::min(match_count, capacity));
-+
-+    if (match_count < capacity || capacity >= max_possible_results) {
-+      return longest->value > 0;
 +    }
 +
-+    vector<Darts::DoubleArray::result_pair_type> results;
-+    while (capacity < max_possible_results) {
-+      size_t next_capacity = capacity * 2;
-+      if (match_count > next_capacity) {
-+        next_capacity = match_count;
-+      }
-+      capacity = std::min(next_capacity, max_possible_results);
-+      results.resize(capacity);
++    // Input ended while the trie path is still alive. The current longest
++    // terminal is valid for this frame, but a future append may extend it.
++    probe->required_prefix = consumed_suffix_bytes + remaining;
++    probe->scanned_bytes = remaining;
++    probe->consumed_suffix_bytes = consumed_suffix_bytes + remaining;
++    probe->node_pos = id;
++    probe->append_sensitive = true;
++    return true;
++  }
 +
-+      match_count = phrase_trie.commonPrefixSearch(current, results.data(),
-+                                                   capacity, remaining);
-+      *longest = {};
-+      select_longest(results.data(), std::min(match_count, capacity));
-+
-+      if (match_count < capacity || capacity >= max_possible_results) {
-+        return longest->value > 0;
-+      }
-+    }
-+    return longest->value > 0;
++  bool ProbeLongestPhrase(const char* suffix,
++                          const char* end,
++                          size_t node_pos,
++                          PhraseProbe* probe) const {
++    const Darts::DoubleArray::result_pair_type empty{};
++    return ProbePhraseFromNode(suffix, end, node_pos, 0, empty, probe);
 +  }
 +
 +  static bool ReadValue(const char** cursor,
@@ -879,7 +1025,9 @@ index 0000000..b82e7ab
 +    while (pos < text.size()) {
 +      const char* current = text_begin + pos;
 +      size_t char_size = 0;
-+      uint32_t dispatch = DispatchAt(current, text_end, &char_size);
++      size_t dispatch_slot = kInvalidIndex;
++      uint32_t dispatch =
++          DispatchAt(current, text_end, &char_size, &dispatch_slot);
 +
 +      if (dispatch == 0) {
 +        const char* scan = current + char_size;
@@ -902,13 +1050,17 @@ index 0000000..b82e7ab
 +      size_t match_size = 0;
 +
 +      if ((dispatch & kDispatchPhraseStarter) != 0 && phrase_key_count != 0) {
-+        Darts::DoubleArray::result_pair_type match{};
-+        if (FindLongestPhrase(current, text_end, &match) &&
-+            match.length > char_size) {
-+          const size_t candidate_key_id = static_cast<size_t>(match.value - 1);
++        size_t node_pos = 0;
++        PhraseProbe probe;
++        if (PhraseNode(dispatch_slot, &node_pos) &&
++            ProbeLongestPhrase(current + char_size, text_end, node_pos,
++                               &probe) &&
++            probe.longest.length != 0) {
++          const size_t candidate_key_id =
++              static_cast<size_t>(probe.longest.value - 1);
 +          if (candidate_key_id < key_count) {
 +            key_id = candidate_key_id;
-+            match_size = match.length;
++            match_size = char_size + probe.longest.length;
 +          }
 +        }
 +      }
@@ -953,6 +1105,256 @@ index 0000000..b82e7ab
 +      }
 +      pos += char_size;
 +    }
++    return changed;
++  }
++
++  bool ConvertSentenceIncremental(std::string_view text,
++                                  RewriteSentenceState* state,
++                                  RewriteSentenceMetrics* metrics) const {
++    if (!state) {
++      return false;
++    }
++    if (metrics) {
++      ++metrics->calls;
++      metrics->input_bytes += text.size();
++    }
++
++    if (state->input.size() == text.size() &&
++        (text.empty() ||
++         std::memcmp(state->input.data(), text.data(), text.size()) == 0)) {
++      if (metrics) {
++        ++metrics->identical_input_hits;
++        metrics->reused_input_bytes += text.size();
++        metrics->reused_hit_count += state->hits.size();
++      }
++      return state->changed;
++    }
++
++    const size_t old_input_size = state->input.size();
++    size_t lcp = 0;
++    const size_t common = std::min(old_input_size, text.size());
++    while (lcp < common && state->input[lcp] == text[lcp]) {
++      ++lcp;
++    }
++
++    RewriteSentenceFrontier resume;
++    bool can_continue_phrase = false;
++    if (state->frontier.valid && text.size() > old_input_size &&
++        lcp == old_input_size) {
++      const auto& frontier = state->frontier;
++      const bool frontier_reaches_old_end =
++          frontier.input_start <= old_input_size &&
++          frontier.first_char_size <= old_input_size - frontier.input_start &&
++          frontier.suffix_bytes ==
++              old_input_size - frontier.input_start - frontier.first_char_size;
++      if (frontier_reaches_old_end &&
++          frontier.output_start <= state->output.size() &&
++          frontier.hit_count <= state->hits.size()) {
++        resume = frontier;
++        can_continue_phrase = true;
++      }
++    }
++
++    size_t reuse_count = 0;
++    size_t pos = 0;
++    size_t output_end = 0;
++    size_t dependency_barrier = 0;
++    bool changed = false;
++
++    if (can_continue_phrase) {
++      reuse_count = resume.hit_count;
++      pos = resume.input_start;
++      output_end = resume.output_start;
++      dependency_barrier = resume.dependency_barrier;
++      changed = resume.changed_before;
++    } else {
++      // Reuse only successful matches whose whole decision was proven inside
++      // the unchanged prefix. Unmatched positions never create cache entries.
++      for (size_t i = 0; i < state->hits.size(); ++i) {
++        const auto& hit = state->hits[i];
++        if (hit.input_end > lcp || hit.required_prefix > lcp ||
++            hit.output_end > state->output.size()) {
++          break;
++        }
++        reuse_count = i + 1;
++        pos = hit.input_end;
++        output_end = hit.output_end;
++        dependency_barrier = hit.required_prefix;
++        changed = hit.changed;
++      }
++    }
++
++    state->output.resize(output_end);
++    state->hits.resize(reuse_count);
++    state->frontier.Reset();
++
++    if (metrics) {
++      if (pos != 0) {
++        ++metrics->prefix_reuse_calls;
++        metrics->reused_input_bytes += pos;
++        metrics->reused_hit_count += reuse_count;
++      } else {
++        ++metrics->full_rescan_calls;
++      }
++      metrics->rescanned_input_bytes += text.size() - pos;
++    }
++
++    const char* const text_begin = text.data();
++    const char* const text_end = text_begin + text.size();
++    constexpr size_t kAppendSensitive = std::numeric_limits<size_t>::max();
++
++    while (pos < text.size()) {
++      const char* current = text_begin + pos;
++      size_t char_size = 0;
++      size_t dispatch_slot = kInvalidIndex;
++      const uint32_t dispatch =
++          DispatchAt(current, text_end, &char_size, &dispatch_slot);
++
++      if (dispatch == 0) {
++        const char* scan = current + char_size;
++        while (scan < text_end) {
++          size_t scan_size = 0;
++          if (DispatchAt(scan, text_end, &scan_size) != 0) {
++            break;
++          }
++          scan += scan_size;
++        }
++        const size_t skipped = static_cast<size_t>(scan - current);
++        state->output.append(current, skipped);
++        if (metrics) {
++          metrics->unmatchable_skip_bytes += skipped;
++        }
++        pos += skipped;
++        continue;
++      }
++
++      size_t key_id = kInvalidIndex;
++      size_t match_size = 0;
++
++      if ((dispatch & kDispatchPhraseStarter) != 0 && phrase_key_count != 0) {
++        PhraseProbe probe;
++        bool used_continuation = false;
++
++        if (can_continue_phrase && pos == resume.input_start &&
++            char_size == resume.first_char_size) {
++          Darts::DoubleArray::result_pair_type prior_longest{};
++          prior_longest.value = static_cast<int>(resume.longest_value);
++          prior_longest.length = resume.longest_length;
++          if (!ProbePhraseFromNode(text_begin + old_input_size, text_end,
++                                   resume.node_pos, resume.suffix_bytes,
++                                   prior_longest, &probe)) {
++            state->Reset();
++            return false;
++          }
++          used_continuation = true;
++          can_continue_phrase = false;
++        } else {
++          size_t node_pos = 0;
++          if (!PhraseNode(dispatch_slot, &node_pos) ||
++              !ProbeLongestPhrase(current + char_size, text_end, node_pos,
++                                  &probe)) {
++            state->Reset();
++            return false;
++          }
++        }
++
++        if (metrics) {
++          ++metrics->phrase_probe_count;
++          metrics->phrase_probe_bytes += probe.scanned_bytes;
++          if (used_continuation) {
++            ++metrics->phrase_probe_continuation_count;
++            metrics->phrase_probe_reused_bytes += resume.suffix_bytes;
++          } else {
++            ++metrics->phrase_probe_restart_count;
++          }
++          if (probe.stopped_by_mismatch) {
++            ++metrics->phrase_probe_mismatch_stops;
++          } else {
++            ++metrics->phrase_probe_text_end_stops;
++          }
++        }
++
++        if (probe.append_sensitive) {
++          if (!state->frontier.valid) {
++            state->frontier.valid = true;
++            state->frontier.input_start = pos;
++            state->frontier.output_start = state->output.size();
++            state->frontier.hit_count = state->hits.size();
++            state->frontier.dependency_barrier = dependency_barrier;
++            state->frontier.first_char_size = char_size;
++            state->frontier.suffix_bytes = probe.consumed_suffix_bytes;
++            state->frontier.node_pos = probe.node_pos;
++            state->frontier.longest_value =
++                probe.longest.value > 0
++                    ? static_cast<uint32_t>(probe.longest.value)
++                    : 0;
++            state->frontier.longest_length = probe.longest.length;
++            state->frontier.changed_before = changed;
++          }
++          dependency_barrier = kAppendSensitive;
++        } else if (dependency_barrier != kAppendSensitive) {
++          dependency_barrier = std::max(
++              dependency_barrier, pos + char_size + probe.required_prefix);
++        }
++
++        if (probe.longest.length != 0) {
++          const size_t candidate_key_id =
++              static_cast<size_t>(probe.longest.value - 1);
++          if (candidate_key_id < key_count) {
++            key_id = candidate_key_id;
++            match_size = char_size + probe.longest.length;
++          }
++        }
++      }
++
++      if (key_id == kInvalidIndex) {
++        const uint32_t encoded_key_id = dispatch & kDispatchKeyMask;
++        if (encoded_key_id != 0) {
++          const size_t candidate_key_id =
++              static_cast<size_t>(encoded_key_id - 1);
++          if (candidate_key_id < key_count) {
++            key_id = candidate_key_id;
++            match_size = char_size;
++          }
++        }
++      }
++
++      if (key_id != kInvalidIndex) {
++        std::string_view value;
++        if (GetFirstValue(key_id, &value)) {
++          const bool replacement_changed =
++              value.size() != match_size ||
++              std::memcmp(value.data(), current, match_size) != 0;
++          changed = changed || replacement_changed;
++          if (replacement_changed) {
++            state->output.append(value.data(), value.size());
++          } else {
++            state->output.append(current, match_size);
++          }
++          pos += match_size;
++
++          // Cache successful decisions only after every preceding probe is
++          // stable. An unresolved end-of-input trie path is represented by
++          // |frontier| and blocks later hit caching until it resolves.
++          if (dependency_barrier != kAppendSensitive) {
++            state->hits.push_back(
++                {pos, state->output.size(), dependency_barrier, changed});
++            if (metrics) {
++              ++metrics->written_hit_count;
++            }
++          }
++          continue;
++        }
++      }
++
++      state->output.append(current, char_size);
++      pos += char_size;
++    }
++
++    // Keep the stable source prefix in place and replace only the changed tail.
++    state->input.resize(lcp);
++    state->input.append(text.data() + lcp, text.size() - lcp);
++    state->changed = changed;
 +    return changed;
 +  }
 +};
@@ -1252,7 +1654,7 @@ index 0000000..b82e7ab
 +  stage.value_pool_end = stage.value_pool + record.value_pool_size;
 +  stage.key_count = record.key_count;
 +  stage.phrase_key_count = record.phrase_key_count;
-+  stage.flags = record.flags;
++  stage.flags = StageFeatureFlags(record.flags);
 +
 +  if (record.phrase_key_count != 0) {
 +    const char* phrase_trie = base + record.phrase_trie_offset;
@@ -1262,6 +1664,9 @@ index 0000000..b82e7ab
 +    stage.phrase_trie.set_array(
 +        phrase_trie, static_cast<size_t>(record.phrase_trie_size /
 +                                         stage.phrase_trie.unit_size()));
++    if (!stage.BuildPhraseNodeCache()) {
++      return false;
++    }
 +  }
 +  return true;
 +}
@@ -1279,6 +1684,13 @@ index 0000000..b82e7ab
 +  return result && impl_->stage.ConvertSentence(text, result);
 +}
 +
++bool RewritePack::ConvertSentenceIncremental(
++    std::string_view text,
++    RewriteSentenceState* state,
++    RewriteSentenceMetrics* metrics) const {
++  return state && impl_->stage.ConvertSentenceIncremental(text, state, metrics);
++}
++
 +bool RewritePackBuilder::Build(const path& output_path,
 +                               const RewriteStageData& stage) const {
 +  return BuildRewritePack(output_path, stage);
@@ -1287,10 +1699,10 @@ index 0000000..b82e7ab
 +}  // namespace rime
 diff --git a/src/rime/dict/rewrite_pack.h b/src/rime/dict/rewrite_pack.h
 new file mode 100644
-index 0000000..f9b8aa7
+index 0000000..023b40a
 --- /dev/null
 +++ b/src/rime/dict/rewrite_pack.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,144 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -1298,6 +1710,7 @@ index 0000000..f9b8aa7
 +#ifndef RIME_REWRITE_PACK_H_
 +#define RIME_REWRITE_PACK_H_
 +
++#include <cstddef>
 +#include <cstdint>
 +#include <memory>
 +#include <string>
@@ -1324,6 +1737,79 @@ index 0000000..f9b8aa7
 +  vector<RewriteEntry> entries;
 +};
 +
++// Runtime-only hot state for enable_sentence. Only successful, reusable
++// matches are cached; failed probes only advance a dependency barrier while
++// rebuilding the uncertain tail.
++struct RewriteSentenceHit {
++  size_t input_end = 0;
++  size_t output_end = 0;
++  size_t required_prefix = 0;
++  bool changed = false;
++};
++
++// Runtime-only continuation state for the earliest phrase probe whose trie
++// path reached the current input end. On a pure append, the next call can
++// continue from |node_pos| instead of traversing the already-seen suffix again.
++struct RewriteSentenceFrontier {
++  bool valid = false;
++  size_t input_start = 0;
++  size_t output_start = 0;
++  size_t hit_count = 0;
++  size_t dependency_barrier = 0;
++  size_t first_char_size = 0;
++  size_t suffix_bytes = 0;
++  size_t node_pos = 0;
++  uint32_t longest_value = 0;
++  size_t longest_length = 0;
++  bool changed_before = false;
++
++  void Reset() { *this = RewriteSentenceFrontier{}; }
++};
++
++struct RewriteSentenceState {
++  string input;
++  string output;
++  vector<RewriteSentenceHit> hits;
++  RewriteSentenceFrontier frontier;
++  bool changed = false;
++
++  void Reset() {
++    string().swap(input);
++    string().swap(output);
++    vector<RewriteSentenceHit>().swap(hits);
++    frontier.Reset();
++    changed = false;
++  }
++
++  size_t RetainedBytes() const {
++    return input.capacity() + output.capacity() +
++           hits.capacity() * sizeof(RewriteSentenceHit);
++  }
++};
++
++// Optional per-call diagnostics for isolated sentence benchmarking.
++// Rewriter passes nullptr in production, so normal candidate processing does
++// not pay counter-maintenance cost.
++struct RewriteSentenceMetrics {
++  uint64_t calls = 0;
++  uint64_t identical_input_hits = 0;
++  uint64_t prefix_reuse_calls = 0;
++  uint64_t full_rescan_calls = 0;
++  uint64_t input_bytes = 0;
++  uint64_t reused_input_bytes = 0;
++  uint64_t rescanned_input_bytes = 0;
++  uint64_t reused_hit_count = 0;
++  uint64_t written_hit_count = 0;
++  uint64_t phrase_probe_count = 0;
++  uint64_t phrase_probe_restart_count = 0;
++  uint64_t phrase_probe_continuation_count = 0;
++  uint64_t phrase_probe_bytes = 0;
++  uint64_t phrase_probe_reused_bytes = 0;
++  uint64_t phrase_probe_mismatch_stops = 0;
++  uint64_t phrase_probe_text_end_stops = 0;
++  uint64_t unmatchable_skip_bytes = 0;
++};
++
 +class RewriteStore;
 +
 +// One RewritePack is exactly one immutable, memory-mapped rewrite stage.
@@ -1335,6 +1821,10 @@ index 0000000..f9b8aa7
 +  bool LookupWithPreedit(std::string_view text,
 +                         vector<RewriteResult>* values) const;
 +  bool ConvertSentence(std::string_view text, string* result) const;
++  bool ConvertSentenceIncremental(
++      std::string_view text,
++      RewriteSentenceState* state,
++      RewriteSentenceMetrics* metrics = nullptr) const;
 +
 + private:
 +  friend class RewriteStore;
@@ -1359,10 +1849,10 @@ index 0000000..f9b8aa7
 +#endif  // RIME_REWRITE_PACK_H_
 diff --git a/src/rime/dict/rewrite_store.cc b/src/rime/dict/rewrite_store.cc
 new file mode 100644
-index 0000000..cb23736
+index 0000000..4d5c69c
 --- /dev/null
 +++ b/src/rime/dict/rewrite_store.cc
-@@ -0,0 +1,1383 @@
+@@ -0,0 +1,1404 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2281,6 +2771,7 @@ index 0000000..cb23736
 +  bool had_file = false;
 +  bool dirty = false;
 +  bool compact = false;
++  bool failed = false;
 +  uint64_t committed_size = 0;
 +  std::array<char, kStoreDataOffset> header{};
 +  StoreSnapshot working;
@@ -2508,6 +2999,21 @@ index 0000000..cb23736
 +  return true;
 +}
 +
++void RewriteStoreWriter::MarkWorkspaceFailed() {
++  std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++  const auto found = RewriteWorkspaces().find(impl_->file_path.u8string());
++  if (found != RewriteWorkspaces().end() && found->second) {
++    found->second->failed = true;
++  }
++}
++
++bool RewriteStoreWriter::WorkspaceFailed() const {
++  std::lock_guard<std::mutex> lock(RewriteWorkspaceMutex());
++  const auto found = RewriteWorkspaces().find(impl_->file_path.u8string());
++  return found != RewriteWorkspaces().end() && found->second &&
++         found->second->failed;
++}
++
 +bool RewriteStoreWriter::HasStage(const RewriteStageId& stage_id) const {
 +  if (!impl_->opened) {
 +    return false;
@@ -2694,6 +3200,11 @@ index 0000000..cb23736
 +  if (!impl_->opened || !impl_->workspace) {
 +    return false;
 +  }
++  if (WorkspaceFailed()) {
++    LOG(ERROR) << "shared rewrite-store transaction is marked failed; "
++                  "refusing to commit partial rewrite data.";
++    return false;
++  }
 +
 +  auto& snapshot = impl_->Snapshot();
 +  if (snapshot.schemas.empty()) {
@@ -2748,10 +3259,10 @@ index 0000000..cb23736
 +}  // namespace rime
 diff --git a/src/rime/dict/rewrite_store.h b/src/rime/dict/rewrite_store.h
 new file mode 100644
-index 0000000..be17625
+index 0000000..b12a351
 --- /dev/null
 +++ b/src/rime/dict/rewrite_store.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,91 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2783,6 +3294,8 @@ index 0000000..be17625
 +  }
 +};
 +
++// One rewriter section may bind to an ordered sequence of shared stages.
++// Order and duplicates in |stages| are semantic.
 +struct RewriteStageBinding {
 +  string name;
 +  vector<RewriteStageId> stages;
@@ -2820,6 +3333,12 @@ index 0000000..be17625
 +  bool Open();
 +  bool BeginWorkspace();
 +  bool AbortWorkspace();
++
++  // Shared workspace failure propagation: once any schema compilation marks
++  // the deployment failed, CommitWorkspace() must refuse a partial commit.
++  void MarkWorkspaceFailed();
++  bool WorkspaceFailed() const;
++
 +  bool HasStage(const RewriteStageId& stage_id) const;
 +  bool AppendStage(const RewriteStageId& stage_id, RewriteStageData stage);
 +  bool CommitSchema(const string& schema_id,
@@ -2857,10 +3376,10 @@ index 4aa5d1d..ab77c58 100644
    if (!r.Find("charset_filter")) {  // allow improved implementation
 diff --git a/src/rime/gear/rewriter.cc b/src/rime/gear/rewriter.cc
 new file mode 100644
-index 0000000..c6453ac
+index 0000000..b473f8c
 --- /dev/null
 +++ b/src/rime/gear/rewriter.cc
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,783 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -2946,10 +3465,14 @@ index 0000000..c6453ac
 + public:
 +  RewriterTranslation(an<Translation> translation,
 +                      const Rewriter* rewriter,
-+                      std::shared_ptr<const Rewriter::RuntimeState> state)
++                      std::shared_ptr<const Rewriter::RuntimeState> state,
++                      size_t segment_start,
++                      bool has_segment_range)
 +      : PrefetchTranslation(translation),
 +        rewriter_(rewriter),
-+        state_(std::move(state)) {}
++        state_(std::move(state)),
++        segment_start_(segment_start),
++        has_segment_range_(has_segment_range) {}
 +
 + protected:
 +  bool Replenish() override {
@@ -2958,7 +3481,9 @@ index 0000000..c6453ac
 +    if (!candidate) {
 +      return false;
 +    }
-+    if (!rewriter_->Transform(*state_, candidate, &cache_)) {
++    const size_t candidate_rank = candidate_rank_++;
++    if (!rewriter_->Transform(*state_, candidate, &cache_, candidate_rank,
++                              segment_start_, has_segment_range_)) {
 +      cache_.push_back(candidate);
 +    }
 +    return !cache_.empty();
@@ -2967,6 +3492,9 @@ index 0000000..c6453ac
 + private:
 +  const Rewriter* rewriter_;
 +  std::shared_ptr<const Rewriter::RuntimeState> state_;
++  size_t segment_start_ = 0;
++  bool has_segment_range_ = false;
++  size_t candidate_rank_ = 0;
 +};
 +
 +class RewriterAbbrevTranslation : public Translation {
@@ -3143,11 +3671,31 @@ index 0000000..c6453ac
 +    schema_id_ = engine_->schema()->schema_id();
 +    store_path_ = ResolveStorePath();
 +  }
++
++  if (options_.enable_sentence && engine_ && engine_->context()) {
++    Context* context = engine_->context();
++    commit_connection_ = context->commit_notifier().connect(
++        [this](Context*) { ClearSentenceCache(); });
++    abort_connection_ = context->abort_notifier().connect(
++        [this](Context*) { ClearSentenceCache(); });
++    update_connection_ =
++        context->update_notifier().connect([this](Context* ctx) {
++          if (!ctx || ctx->input().empty() || !ctx->IsComposing()) {
++            ClearSentenceCache();
++          }
++        });
++  }
++
 +  std::lock_guard<std::mutex> lock(RewriterRegistryMutex());
 +  RewriterRegistry().insert(this);
 +}
 +
 +Rewriter::~Rewriter() {
++  commit_connection_.disconnect();
++  abort_connection_.disconnect();
++  update_connection_.disconnect();
++  ClearSentenceCache();
++
 +  std::lock_guard<std::mutex> lock(RewriterRegistryMutex());
 +  RewriterRegistry().erase(this);
 +}
@@ -3317,9 +3865,44 @@ index 0000000..c6453ac
 +  return state;
 +}
 +
++void Rewriter::ClearSentenceCache() {
++  for (auto& lane : sentence_lanes_) {
++    lane.Reset();
++  }
++}
++
++Rewriter::SentenceLane* Rewriter::PrepareSentenceLane(
++    const RuntimeState& state,
++    size_t candidate_rank,
++    size_t segment_start,
++    bool has_segment_range) const {
++  if (!options_.enable_sentence || candidate_rank >= kSentenceCacheLanes ||
++      !state.store) {
++    return nullptr;
++  }
++
++  auto& lane = sentence_lanes_[candidate_rank];
++  const uint64_t generation = state.store->generation();
++  if (!lane.valid || lane.store_generation != generation ||
++      lane.has_segment_range != has_segment_range ||
++      (has_segment_range && lane.segment_start != segment_start) ||
++      lane.stages.size() != state.stages.size()) {
++    lane.Reset();
++    lane.valid = true;
++    lane.has_segment_range = has_segment_range;
++    lane.segment_start = segment_start;
++    lane.store_generation = generation;
++    lane.stages.resize(state.stages.size());
++  }
++  return &lane;
++}
++
 +bool Rewriter::Rewrite(const RuntimeState& state,
 +                       std::string_view text,
-+                       vector<string>* values) const {
++                       vector<string>* values,
++                       size_t candidate_rank,
++                       size_t segment_start,
++                       bool has_segment_range) const {
 +  if (!values) {
 +    return false;
 +  }
@@ -3329,21 +3912,49 @@ index 0000000..c6453ac
 +  }
 +
 +  if (options_.enable_sentence) {
-+    string current(text);
++    SentenceLane* lane = PrepareSentenceLane(state, candidate_rank,
++                                             segment_start, has_segment_range);
++    std::string_view current = text;
 +    bool matched = false;
-+    for (const auto& loaded : state.stages) {
-+      string rewritten;
-+      if (loaded.pack->ConvertSentence(current, &rewritten)) {
-+        current = std::move(rewritten);
-+        matched = true;
++
++    if (lane) {
++      for (size_t i = 0; i < state.stages.size(); ++i) {
++        auto& sentence_state = lane->stages[i];
++        if (state.stages[i].pack->ConvertSentenceIncremental(current,
++                                                             &sentence_state)) {
++          current = sentence_state.output;
++          matched = true;
++        }
++        // A miss is a no-op for this stage. The current text must still reach
++        // later stages in a preset such as s2t -> t2hk.
 +      }
-+      // A miss is a no-op for this stage. The current text must still reach
-+      // later stages in a preset such as s2t -> t2hk.
++    } else {
++      string current_storage(text);
++      for (const auto& loaded : state.stages) {
++        string rewritten;
++        if (loaded.pack->ConvertSentence(current_storage, &rewritten)) {
++          current_storage = std::move(rewritten);
++          matched = true;
++        }
++      }
++      if (!matched) {
++        return false;
++      }
++      values->push_back(std::move(current_storage));
++      return true;
 +    }
++
 +    if (!matched) {
++      if (lane && lane->RetainedBytes() > kMaxSentenceCacheBytes) {
++        lane->Reset();
++      }
 +      return false;
 +    }
-+    values->push_back(std::move(current));
++
++    values->emplace_back(current);
++    if (lane && lane->RetainedBytes() > kMaxSentenceCacheBytes) {
++      lane->Reset();
++    }
 +    return true;
 +  }
 +
@@ -3465,7 +4076,10 @@ index 0000000..c6453ac
 +
 +bool Rewriter::Transform(const RuntimeState& state,
 +                         const an<Candidate>& candidate,
-+                         CandidateQueue* result) const {
++                         CandidateQueue* result,
++                         size_t candidate_rank,
++                         size_t segment_start,
++                         bool has_segment_range) const {
 +  // Apply() already gates the translation on the current option state. Avoid
 +  // querying Context::get_option() again for every candidate in the hot path.
 +  if (!candidate || !result || state.stages.empty()) {
@@ -3477,7 +4091,8 @@ index 0000000..c6453ac
 +  }
 +
 +  vector<string> values;
-+  if (!Rewrite(state, candidate->text(), &values)) {
++  if (!Rewrite(state, candidate->text(), &values, candidate_rank, segment_start,
++               has_segment_range)) {
 +    return false;
 +  }
 +
@@ -3519,11 +4134,20 @@ index 0000000..c6453ac
 +  const size_t segment_end = segment_end_;
 +  has_segment_range_ = false;
 +
-+  if (!translation || !Active()) {
++  if (!translation) {
++    return translation;
++  }
++  if (!Active()) {
++    if (options_.enable_sentence) {
++      ClearSentenceCache();
++    }
 +    return translation;
 +  }
 +  auto state = EnsureState();
 +  if (!state) {
++    if (options_.enable_sentence) {
++      ClearSentenceCache();
++    }
 +    return translation;
 +  }
 +  if (options_.mode == Mode::kAbbrev) {
@@ -3534,16 +4158,17 @@ index 0000000..c6453ac
 +    return New<RewriterAbbrevTranslation>(translation, this, std::move(state),
 +                                          context, segment_start, segment_end);
 +  }
-+  return New<RewriterTranslation>(translation, this, std::move(state));
++  return New<RewriterTranslation>(translation, this, std::move(state),
++                                  segment_start, has_segment_range);
 +}
 +
 +}  // namespace rime
 diff --git a/src/rime/gear/rewriter.h b/src/rime/gear/rewriter.h
 new file mode 100644
-index 0000000..2db98e8
+index 0000000..e1703d5
 --- /dev/null
 +++ b/src/rime/gear/rewriter.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,153 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -3551,6 +4176,7 @@ index 0000000..2db98e8
 +#ifndef RIME_REWRITER_H_
 +#define RIME_REWRITER_H_
 +
++#include <array>
 +#include <atomic>
 +#include <memory>
 +#include <mutex>
@@ -3616,16 +4242,58 @@ index 0000000..2db98e8
 +  std::shared_ptr<const RuntimeState> EnsureState();
 +  bool Rewrite(const RuntimeState& state,
 +               std::string_view text,
-+               vector<string>* values) const;
++               vector<string>* values,
++               size_t candidate_rank,
++               size_t segment_start,
++               bool has_segment_range) const;
 +  bool RewriteWithPreedit(const RuntimeState& state,
 +                          std::string_view text,
 +                          vector<RewriteResult>* values) const;
 +  bool Transform(const RuntimeState& state,
 +                 const an<Candidate>& candidate,
-+                 CandidateQueue* result) const;
++                 CandidateQueue* result,
++                 size_t candidate_rank,
++                 size_t segment_start,
++                 bool has_segment_range) const;
 +  const string& CandidateType(const an<Candidate>& candidate) const;
 +  string DerivedComment(const an<Candidate>& candidate) const;
 +  string ApplyCommentTemplate(const string& value) const;
++
++  static constexpr size_t kSentenceCacheLanes = 8;
++  static constexpr size_t kMaxSentenceCacheBytes = 64 * 1024;
++
++  struct SentenceLane {
++    bool valid = false;
++    bool has_segment_range = false;
++    size_t segment_start = 0;
++    uint64_t store_generation = 0;
++    vector<RewriteSentenceState> stages;
++
++    void Reset() {
++      valid = false;
++      has_segment_range = false;
++      segment_start = 0;
++      store_generation = 0;
++      for (auto& stage : stages) {
++        stage.Reset();
++      }
++      vector<RewriteSentenceState>().swap(stages);
++    }
++
++    size_t RetainedBytes() const {
++      size_t total = 0;
++      for (const auto& stage : stages) {
++        total += stage.RetainedBytes();
++      }
++      return total;
++    }
++  };
++
++  void ClearSentenceCache();
++  SentenceLane* PrepareSentenceLane(const RuntimeState& state,
++                                    size_t candidate_rank,
++                                    size_t segment_start,
++                                    bool has_segment_range) const;
 +
 +  Options options_;
 +  string schema_id_;
@@ -3633,6 +4301,12 @@ index 0000000..2db98e8
 +  std::shared_ptr<const RuntimeState> runtime_state_;
 +  std::mutex runtime_state_mutex_;
 +  bool runtime_state_load_attempted_ = false;
++
++  mutable std::array<SentenceLane, kSentenceCacheLanes> sentence_lanes_;
++  connection commit_connection_;
++  connection abort_connection_;
++  connection update_connection_;
++
 +  size_t segment_start_ = 0;
 +  size_t segment_end_ = 0;
 +  bool has_segment_range_ = false;
@@ -3771,20 +4445,22 @@ index a51fe9f..efed947 100644
  
 diff --git a/src/rime/lever/rewrite_compiler.cc b/src/rime/lever/rewrite_compiler.cc
 new file mode 100644
-index 0000000..024771b
+index 0000000..52ea903
 --- /dev/null
 +++ b/src/rime/lever/rewrite_compiler.cc
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,718 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
 +//
 +// The deployment compiler accepts either native files or a shared preset.
-+// A preset expands to independent reusable stages; execution order is not
-+// encoded in RewriteStore/RewritePack and remains a runtime concern.
++// A preset expands to independent reusable stages. Stage order (including
++// duplicate stages) is stored in the schema/section binding; stages themselves
++// remain independently reusable and are never synthesized into a combined pack.
 +#include <rime/lever/rewrite_compiler.h>
 +
 +#include <algorithm>
++#include <boost/algorithm/string/predicate.hpp>
 +#include <array>
 +#include <cstdint>
 +#include <filesystem>
@@ -3807,13 +4483,8 @@ index 0000000..024771b
 +constexpr size_t kMaxSourceLineBytes = 16 * 1024 * 1024;
 +constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
 +constexpr uint64_t kFnvPrime = 1099511628211ULL;
-+constexpr uint64_t kStageFingerprintContractVersion = 1;
++constexpr uint64_t kStageFingerprintContractVersion = 3;
 +constexpr uint64_t kSecondHashSeed = 0x9e3779b97f4a7c15ULL;
-+
-+bool StartsWith(const string& text, const string& prefix) {
-+  return text.size() >= prefix.size() &&
-+         std::equal(prefix.begin(), prefix.end(), text.begin());
-+}
 +
 +bool PrepareSourceLine(string* line) {
 +  if (!line) {
@@ -3837,8 +4508,6 @@ index 0000000..024771b
 +    return false;
 +  }
 +
-+  // The source format is literal key<TAB>value. Only the first real tab is
-+  // structural; everything after it belongs to value unchanged.
 +  const size_t tab = source.find('\t');
 +  if (tab == std::string_view::npos || tab == 0 || tab + 1 >= source.size()) {
 +    return false;
@@ -4299,7 +4968,7 @@ index 0000000..024771b
 +    string section;
 +    if (component == "rewriter") {
 +      section = "rewriter";
-+    } else if (StartsWith(component, "rewriter@")) {
++    } else if (boost::starts_with(component, "rewriter@")) {
 +      section = component.substr(sizeof("rewriter@") - 1);
 +    } else {
 +      continue;
@@ -4365,8 +5034,16 @@ index 0000000..024771b
 +    : schema_id_(schema_id), config_(config), deployer_(deployer) {}
 +
 +bool RewriteCompiler::Compile() {
-+  if (!config_ || !deployer_) {
++  auto fail = [&]() {
++    if (deployer_) {
++      RewriteStoreWriter store(deployer_->staging_dir / "rewriter.rwp");
++      store.MarkWorkspaceFailed();
++    }
 +    return false;
++  };
++
++  if (!config_ || !deployer_) {
++    return fail();
 +  }
 +
 +  const path schema_id_path(schema_id_);
@@ -4377,7 +5054,7 @@ index 0000000..024771b
 +               << schema_id_
 +               << "' is invalid; expected a single non-empty schema id "
 +                  "without path components.";
-+    return false;
++    return fail();
 +  }
 +
 +  std::error_code ec;
@@ -4386,23 +5063,29 @@ index 0000000..024771b
 +    LOG(ERROR) << "cannot create rewrite staging directory '"
 +               << deployer_->staging_dir << "': " << ec.message()
 +               << "; check directory permissions and available storage.";
-+    return false;
++    return fail();
 +  }
 +
 +  const path store_path = deployer_->staging_dir / "rewriter.rwp";
 +  RewriteStoreWriter store(store_path);
 +  if (!store.Open()) {
++    return fail();
++  }
++  if (store.WorkspaceFailed()) {
 +    return false;
 +  }
 +
 +  const vector<string> section_names = FindRewriterSections(config_);
 +  if (section_names.empty()) {
-+    return store.CommitSchema(schema_id_, {});
++    if (!store.CommitSchema(schema_id_, {})) {
++      return fail();
++    }
++    return true;
 +  }
 +
 +  vector<RewriteSourceBinding> sources;
 +  if (!ResolveRewriteSources(config_, deployer_, section_names, &sources)) {
-+    return false;
++    return fail();
 +  }
 +
 +  struct CachedStage {
@@ -4428,7 +5111,7 @@ index 0000000..024771b
 +        stage_id = cached->id;
 +      } else {
 +        if (!ComputeStageId(source, &stage_id)) {
-+          return false;
++          return fail();
 +        }
 +        stage_cache.push_back({descriptor, stage_id});
 +        if (!store.HasStage(stage_id)) {
@@ -4437,7 +5120,7 @@ index 0000000..024771b
 +              !store.AppendStage(stage_id, std::move(stage))) {
 +            LOG(ERROR) << "failed to compile rewrite stage '" << source.name
 +                       << "'.";
-+            return false;
++            return fail();
 +          }
 +        }
 +      }
@@ -4449,7 +5132,7 @@ index 0000000..024771b
 +  if (!store.CommitSchema(schema_id_, bindings)) {
 +    LOG(ERROR) << "failed to commit rewrite index for schema '" << schema_id_
 +               << "'.";
-+    return false;
++    return fail();
 +  }
 +  return true;
 +}
@@ -4527,10 +5210,10 @@ index 0000000..b00eb3d
 +#endif  // RIME_REWRITE_COMPILER_H_
 diff --git a/src/rime/lever/rewrite_preset.cc b/src/rime/lever/rewrite_preset.cc
 new file mode 100644
-index 0000000..aa1165b
+index 0000000..4027b27
 --- /dev/null
 +++ b/src/rime/lever/rewrite_preset.cc
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,152 @@
 +//
 +// Copyright RIME Developers
 +// Distributed under the BSD License
@@ -4538,6 +5221,7 @@ index 0000000..aa1165b
 +#include <rime/lever/rewrite_preset.h>
 +
 +#include <filesystem>
++#include <unordered_set>
 +
 +#include <rime/config.h>
 +
@@ -4655,12 +5339,17 @@ index 0000000..aa1165b
 +    RewritePresetStage stage;
 +    stage.name = stage_name;
 +    stage.files.reserve(file_names.size());
++    std::unordered_set<string> seen;
 +    for (const auto& file_name : file_names) {
 +      if (!IsSimpleFileName(file_name)) {
 +        LOG(ERROR) << "rewrite preset stage '" << stage_name
 +                   << "' contains invalid file name '" << file_name << "'.";
 +        return false;
 +      }
++      if (!seen.insert(file_name).second) {
++        continue;
++      }
++
 +      const path file_path = impl_->canonical_root / file_name;
 +      const path canonical_file = fs::canonical(file_path, ec);
 +      if (ec || !fs::is_regular_file(canonical_file, ec) || ec ||
