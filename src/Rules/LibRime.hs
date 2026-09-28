@@ -63,7 +63,20 @@ librimeRule = do
             -- rewrite_pack). Additive: Compile() returns early when the schema
             -- declares no rewriter section, so existing schemas are unaffected.
             -- Authored against upstream 74bd5dc4, which is the pinned submodule.
-            cmd_ (Cwd src) "git apply ../patches/librime-pr1232-rewrite-filter.patch",
+            cmd_ (Cwd src) "git apply ../patches/librime-pr1232-rewrite-filter.patch"
+            -- DetectModifications decided "the config changed" by comparing the
+            -- newest mtime of the data directories (or a *.yaml directly inside
+            -- them) against var/last_build_time. Unrelated activity in the same
+            -- directory - a userdb being written, CleanupTrash moving files into
+            -- trash/, the .temp.userdb scratch dir that sync creates and removes,
+            -- installation.yaml being rewritten - bumped that mtime too, and the
+            -- tasks that run after last_build_time is recorded bumped it again.
+            -- On Android the result was a full deployment on essentially every
+            -- cold start, and every keystroke typed during it was dropped or
+            -- leaked to the editor. Compare a fingerprint of the config files
+            -- themselves instead. Must stay last: it is authored against the
+            -- state produced by all of the patches above.
+            cmd_ (Cwd src) "git apply ../patches/librime-detect-modifications-fingerprint.patch",
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",
