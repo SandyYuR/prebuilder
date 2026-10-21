@@ -1,0 +1,10 @@
+# Ordered Android patch series for the pinned upstream librime commit.
+librime.patch
+librime-conditional-tabs-test.patch
+librime-perf-syllabifier-cache-repeated-QuerySpelling-iterat.patch
+librime-perf-deploy-compile-independent-dictionaries-in-para.patch
+librime-userdict-cache.patch
+librime-fix-mapped-file-remap.patch
+librime-defer-composition-refresh-on-delete.patch
+librime-pr1232-rewrite-filter.patch
+librime-detect-modifications-fingerprint.patch
