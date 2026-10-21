@@ -5,13 +5,23 @@ on:
     branches: ["*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [everything, librime-only]
+        default: everything
 
 permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: prebuilder-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    if: inputs.target != 'librime-only' && !startsWith(github.head_ref || github.ref_name, 'feat/librime-')
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     env:
@@ -148,3 +158,69 @@ jobs:
           echo "has_librime=$HAS_LIBRIME" >> "$GITHUB_OUTPUT"
           echo "has_predict=$HAS_PREDICT" >> "$GITHUB_OUTPUT"
 
+
+  librime_update:
+    if: inputs.target == 'librime-only' || startsWith(github.head_ref || github.ref_name, 'feat/librime-')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a, x86, x86_64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch pinned engine and plugin sources
+        run: git submodule update --init --depth 1 librime librime-lua librime-octagram librime-predict-leveldb
+      - uses: actions/checkout@v6
+        with:
+          repository: SandyYuR/prebuilt
+          ref: 1126616c3ec569617da772e30d7a97f6b2694172
+          path: native-deps
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'ndk;28.0.13004108 cmake;3.31.6'
+      - name: Rebuild the pinned engine against the existing dependencies
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/28.0.13004108
+          CMAKE_BIN: ${{ env.ANDROID_HOME }}/cmake/3.31.6/bin/cmake
+        run: bash scripts/build-librime-only.sh '${{ matrix.abi }}' native-deps 'build/librime-${{ matrix.abi }}'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: librime-${{ matrix.abi }}
+          path: build/librime-${{ matrix.abi }}/product/
+
+  librime_host_tests:
+    if: inputs.target == 'librime-only' || startsWith(github.head_ref || github.ref_name, 'feat/librime-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: git submodule update --init --depth 1 librime
+      - name: Install native test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-all-dev libgoogle-glog-dev libyaml-cpp-dev libleveldb-dev libmarisa-dev libopencc-dev libgtest-dev
+      - name: Prepare the same ordered patch series
+        run: python3 scripts/prepare-librime.py build/host-source --without-plugins
+      - name: Build and run upstream and downstream engine tests
+        run: |
+          cmake -S build/host-source/librime -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST=ON -DBUILD_TOOLS=OFF
+          cmake --build build/host --parallel 2
+          ctest --test-dir build/host --output-on-failure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: librime-host-test-results
+          path: |
+            build/host/Testing/
+            build/host-source/source-manifest.json

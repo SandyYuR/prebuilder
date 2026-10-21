@@ -1,5 +1,5 @@
 diff --git a/src/rime/lever/deployment_tasks.cc b/src/rime/lever/deployment_tasks.cc
-index efed947..64fef7b 100644
+index ee75187..b643015 100644
 --- a/src/rime/lever/deployment_tasks.cc
 +++ b/src/rime/lever/deployment_tasks.cc
 @@ -9,6 +9,8 @@
@@ -74,7 +74,7 @@ index efed947..64fef7b 100644
 +      throw fs::filesystem_error("ConfigFingerprint: bad data directory", dir,
 +                                 ec);
 +    }
-+    dirs.push_back(p.u8string());
++    dirs.push_back(p.to_utf8_string());
 +  }
 +  std::sort(dirs.begin(), dirs.end());
 +
@@ -84,7 +84,7 @@ index efed947..64fef7b 100644
 +    const string dir_tag = std::to_string(i);
 +    for (fs::directory_iterator iter(p), end; iter != end; ++iter) {
 +      const path entry = iter->path();
-+      const string filename = entry.filename().u8string();
++      const string filename = entry.filename().to_utf8_string();
 +      if (!IsScannedConfig(filename)) {
 +        continue;
 +      }
@@ -144,7 +144,7 @@ index efed947..64fef7b 100644
  DetectModifications::DetectModifications(TaskInitializer arg) {
    try {
      data_dirs_ = std::any_cast<vector<path>>(arg);
-@@ -52,37 +180,31 @@ DetectModifications::DetectModifications(TaskInitializer arg) {
+@@ -52,37 +180,26 @@ DetectModifications::DetectModifications(TaskInitializer arg) {
  }
  
  bool DetectModifications::Run(Deployer* deployer) {
@@ -153,7 +153,6 @@ index efed947..64fef7b 100644
 +    LOG(ERROR) << "DetectModifications: no data directory to scan.";
 +    return true;
 +  }
-+
 +  string fingerprint;
    try {
 -    for (auto dir : data_dirs_) {
@@ -164,8 +163,8 @@ index efed947..64fef7b 100644
 -        for (fs::directory_iterator iter(p), end; iter != end; ++iter) {
 -          path entry(iter->path());
 -          if (fs::is_regular_file(fs::canonical(entry)) &&
--              entry.extension().u8string() == ".yaml" &&
--              entry.filename().u8string() != "user.yaml") {
+-              entry.extension().to_utf8_string() == ".yaml" &&
+-              entry.filename().to_utf8_string() != "user.yaml") {
 -            last_modified =
 -                (std::max)(last_modified,
 -                           filesystem::to_time_t(fs::last_write_time(entry)));
@@ -178,7 +177,7 @@ index efed947..64fef7b 100644
      LOG(ERROR) << "Error reading file information: " << ex.what();
      return true;
    }
- 
+-
 -  // TODO: store as 64-bit number to avoid the year 2038 problem
 -  int last_build_time = 0;
 +  string recorded;
@@ -186,9 +185,6 @@ index efed947..64fef7b 100644
      the<Config> user_config(Config::Require("user_config")->Create("user"));
 -    user_config->GetInt("var/last_build_time", &last_build_time);
 +    if (!user_config->GetString("var/workspace_fingerprint", &recorded)) {
-+      // Nothing recorded yet: a fresh installation, or a user.yaml written by
-+      // a librime that only kept var/last_build_time. Deploy once so the
-+      // fingerprint gets established; from then on this is stable.
 +      LOG(INFO) << "workspace fingerprint not recorded; assuming changes.";
 +      return true;
 +    }
@@ -198,7 +194,7 @@ index efed947..64fef7b 100644
      LOG(INFO) << "modifications detected. workspace needs update.";
      return true;
    }
-@@ -517,6 +639,26 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
+@@ -517,6 +634,26 @@ bool WorkspaceUpdate::Run(Deployer* deployer) {
              << failure << " failure.";
  
    the<Config> user_config(Config::Require("user_config")->Create("user"));

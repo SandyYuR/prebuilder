@@ -1,5 +1,5 @@
 diff --git a/src/rime/context.cc b/src/rime/context.cc
-index cab1371d..07171f34 100644
+index cab1371..07171f3 100644
 --- a/src/rime/context.cc
 +++ b/src/rime/context.cc
 @@ -70,6 +70,8 @@ bool Context::PushInput(char ch) {
@@ -197,7 +197,7 @@ index cab1371d..07171f34 100644
 +
  }  // namespace rime
 diff --git a/src/rime/context.h b/src/rime/context.h
-index f12bcc8f..79588d58 100644
+index f12bcc8..79588d5 100644
 --- a/src/rime/context.h
 +++ b/src/rime/context.h
 @@ -64,6 +64,8 @@ class RIME_DLL Context {
@@ -244,47 +244,42 @@ index f12bcc8f..79588d58 100644
    Notifier commit_notifier_;
    Notifier select_notifier_;
 diff --git a/src/rime/engine.cc b/src/rime/engine.cc
-index 4a54f64c..4bff6666 100644
+index 67d4f81..4a6eec4 100644
 --- a/src/rime/engine.cc
 +++ b/src/rime/engine.cc
-@@ -8,6 +8,7 @@
+@@ -9,6 +9,7 @@
  #include <rime/common.h>
  #include <rime/composition.h>
  #include <rime/context.h>
 +#include <rime/dict/dictionary.h>
+ #include <rime/config/config_types.h>
  #include <rime/engine.h>
  #include <rime/filter.h>
- #include <rime/formatter.h>
-@@ -33,7 +34,18 @@ class ConcreteEngine : public Engine {
-   virtual void ApplySchema(Schema* schema);
+@@ -101,6 +102,22 @@ class ConcreteEngine : public Engine {
    virtual void CommitText(string text);
    virtual void Compose(Context* ctx);
--
-+  virtual void CollectInputTabs(size_t pos, vector<InputTabEntry>* tabs) const {
-+    for (auto& t : translators_) {
-+      t->CollectInputTabs(pos, tabs);
+ 
++  void CollectInputTabs(size_t pos, vector<InputTabEntry>* tabs) const override {
++    for (const auto& entry : translators_) {
++      if (entry.enabled)
++        entry.component->CollectInputTabs(pos, tabs);
 +    }
 +  }
-+  virtual Dictionary* primary_dictionary() const {
-+    for (auto& t : translators_) {
-+      if (auto* d = t->primary_dictionary(); d && d->loaded())
-+        return d;
++  Dictionary* primary_dictionary() const override {
++    for (const auto& entry : translators_) {
++      if (!entry.enabled)
++        continue;
++      if (auto* dict = entry.component->primary_dictionary(); dict && dict->loaded())
++        return dict;
 +    }
 +    return nullptr;
 +  }
-  protected:
-   void InitializeComponents();
-   void InitializeOptions();
-@@ -210,6 +222,7 @@ void ConcreteEngine::TranslateSegments(Segmentation* segments) {
-     size_t len = segment.end - segment.start;
-     string input = segments->input().substr(segment.start, len);
-     DLOG(INFO) << "translating segment: [" << input << "]";
 +
-     auto menu = New<Menu>();
-     for (auto& translator : translators_) {
-       auto translation = translator->Query(input, segment);
+  protected:
+   bool ProcessKey(const KeyEvent& key_event, bool synthetic);
+   void InitializeComponents();
 diff --git a/src/rime/engine.h b/src/rime/engine.h
-index 6b51a68e..7d2b27c2 100644
+index ca8d78f..d83beda 100644
 --- a/src/rime/engine.h
 +++ b/src/rime/engine.h
 @@ -10,12 +10,14 @@
@@ -302,7 +297,7 @@ index 6b51a68e..7d2b27c2 100644
  
  class Engine : public Messenger {
   public:
-@@ -27,6 +29,12 @@ class Engine : public Messenger {
+@@ -28,6 +30,12 @@ class Engine : public Messenger {
    virtual void CommitText(string text) { sink_(text); }
    virtual void Compose(Context* ctx) {}
  
@@ -316,7 +311,7 @@ index 6b51a68e..7d2b27c2 100644
    Context* context() const { return context_.get(); }
    CommitSink& sink() { return sink_; }
 diff --git a/src/rime/gear/editor.cc b/src/rime/gear/editor.cc
-index 37b3dda6..f512da82 100644
+index 37b3dda..f512da8 100644
 --- a/src/rime/gear/editor.cc
 +++ b/src/rime/gear/editor.cc
 @@ -125,8 +125,13 @@ bool Editor::CommitComposition(Context* ctx) {
@@ -336,7 +331,7 @@ index 37b3dda6..f512da82 100644
  }
  
 diff --git a/src/rime/gear/reverse_lookup_translator.cc b/src/rime/gear/reverse_lookup_translator.cc
-index c8c9e973..8ac5312f 100644
+index fb0b345..8fec0ca 100644
 --- a/src/rime/gear/reverse_lookup_translator.cc
 +++ b/src/rime/gear/reverse_lookup_translator.cc
 @@ -6,6 +6,7 @@
@@ -473,8 +468,8 @@ index c8c9e973..8ac5312f 100644
      if (options_ && options_->enable_completion()) {
        dict_->LookupWords(&iter, code, true, 100, nullptr);
        quality = !iter.exhausted() && (iter.Peek()->remaining_code_length == 0);
-@@ -180,6 +264,9 @@ an<Translation> ReverseLookupTranslator::Query(const string& input,
-       Syllabifier syllabifier("", true, options_->strict_spelling());
+@@ -181,6 +265,9 @@ an<Translation> ReverseLookupTranslator::Query(const string& input,
+                               options_->strict_spelling());
        size_t consumed =
            syllabifier.BuildSyllableGraph(code, *dict_->prism(), &graph);
 +      ApplyTabConstraints(&graph, dict_.get(),
@@ -483,7 +478,7 @@ index c8c9e973..8ac5312f 100644
        if (consumed == code.length()) {
          auto collector = dict_->Lookup(graph, 0);
          if (collector && !collector->empty() &&
-@@ -199,4 +286,95 @@ an<Translation> ReverseLookupTranslator::Query(const string& input,
+@@ -200,4 +287,95 @@ an<Translation> ReverseLookupTranslator::Query(const string& input,
    return nullptr;
  }
  
@@ -580,7 +575,7 @@ index c8c9e973..8ac5312f 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/reverse_lookup_translator.h b/src/rime/gear/reverse_lookup_translator.h
-index 7ca038f6..a29dba28 100644
+index 7ca038f..a29dba2 100644
 --- a/src/rime/gear/reverse_lookup_translator.h
 +++ b/src/rime/gear/reverse_lookup_translator.h
 @@ -10,6 +10,7 @@
@@ -625,7 +620,7 @@ index 7ca038f6..a29dba28 100644
  
  }  // namespace rime
 diff --git a/src/rime/gear/script_translator.cc b/src/rime/gear/script_translator.cc
-index eae1293a..c786befd 100644
+index eae1293..c786bef 100644
 --- a/src/rime/gear/script_translator.cc
 +++ b/src/rime/gear/script_translator.cc
 @@ -95,6 +95,8 @@ class ScriptSyllabifier : public PhraseSyllabifier {
@@ -1021,7 +1016,7 @@ index eae1293a..c786befd 100644
    }
    return nullptr;
 diff --git a/src/rime/gear/script_translator.h b/src/rime/gear/script_translator.h
-index 64211df6..9ac44bc4 100644
+index 64211df..9ac44bc 100644
 --- a/src/rime/gear/script_translator.h
 +++ b/src/rime/gear/script_translator.h
 @@ -11,6 +11,8 @@
@@ -1075,7 +1070,7 @@ index 64211df6..9ac44bc4 100644
    int max_homophones_ = 1;
    int spelling_hints_ = 0;
 diff --git a/src/rime/gear/table_translator.cc b/src/rime/gear/table_translator.cc
-index 67bc2292..b7aed6d2 100644
+index 67bc229..b7aed6d 100644
 --- a/src/rime/gear/table_translator.cc
 +++ b/src/rime/gear/table_translator.cc
 @@ -16,7 +16,9 @@
@@ -1274,7 +1269,7 @@ index 67bc2292..b7aed6d2 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/table_translator.h b/src/rime/gear/table_translator.h
-index 7057ed4b..9aa0e034 100644
+index 7057ed4..9aa0e03 100644
 --- a/src/rime/gear/table_translator.h
 +++ b/src/rime/gear/table_translator.h
 @@ -37,6 +37,17 @@ class TableTranslator : public Translator,
@@ -1312,7 +1307,7 @@ index 7057ed4b..9aa0e034 100644
    size_t start_;
    size_t end_;
 diff --git a/src/rime/gear/translator_commons.cc b/src/rime/gear/translator_commons.cc
-index 7fc0f272..eadcf53e 100644
+index 7fc0f27..eadcf53 100644
 --- a/src/rime/gear/translator_commons.cc
 +++ b/src/rime/gear/translator_commons.cc
 @@ -177,4 +177,69 @@ bool TranslatorOptions::IsUserDictDisabledFor(const string& input) const {
@@ -1386,7 +1381,7 @@ index 7fc0f272..eadcf53e 100644
 +
  }  // namespace rime
 diff --git a/src/rime/gear/translator_commons.h b/src/rime/gear/translator_commons.h
-index 6217e5a7..44cff5ca 100644
+index 6217e5a..44cff5c 100644
 --- a/src/rime/gear/translator_commons.h
 +++ b/src/rime/gear/translator_commons.h
 @@ -59,6 +59,7 @@ class PhraseSyllabifier {
@@ -1431,7 +1426,7 @@ index 6217e5a7..44cff5ca 100644
  
  #endif  // RIME_TRANSLATOR_COMMONS_H_
 diff --git a/src/rime/service.h b/src/rime/service.h
-index a69ae741..76438819 100644
+index a69ae74..7643881 100644
 --- a/src/rime/service.h
 +++ b/src/rime/service.h
 @@ -42,6 +42,7 @@ class Session {
@@ -1443,7 +1438,7 @@ index a69ae741..76438819 100644
    const string& commit_text() const { return commit_text_; }
  
 diff --git a/src/rime/translator.h b/src/rime/translator.h
-index 78ba7e22..4950fb46 100644
+index 78ba7e2..4950fb4 100644
 --- a/src/rime/translator.h
 +++ b/src/rime/translator.h
 @@ -15,10 +15,19 @@
@@ -1480,7 +1475,7 @@ index 78ba7e22..4950fb46 100644
  
   protected:
 diff --git a/src/rime_api.h b/src/rime_api.h
-index 5b8985df..030ff78a 100644
+index 5b8985d..030ff78 100644
 --- a/src/rime_api.h
 +++ b/src/rime_api.h
 @@ -521,6 +521,50 @@ typedef struct RIME_FLAVORED(rime_api_t) {
@@ -1535,7 +1530,7 @@ index 5b8985df..030ff78a 100644
  
  //! API entry
 diff --git a/src/rime_api_impl.h b/src/rime_api_impl.h
-index 0fb6c696..f5997117 100644
+index 0fb6c69..f599711 100644
 --- a/src/rime_api_impl.h
 +++ b/src/rime_api_impl.h
 @@ -17,6 +17,10 @@
