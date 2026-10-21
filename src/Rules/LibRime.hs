@@ -43,40 +43,9 @@ librimeRule = do
             cmd_ (Cwd librimePredictSrc) "git checkout ."
             cmd_ (Cwd librimePredictSrc) "git submodule update --init --recursive -v"
             cmd_ (Cwd librimePredictSrc) "git apply ../patches/librime-predict.patch"
-            -- remove absolute path by __FILE__ macro; tabs selectable; refactor tabs
-            cmd_ (Cwd src) "git checkout ."
-            cmd_ (Cwd src) "git clean -xdf test"
-            cmd_ (Cwd src) "git apply ../patches/librime.patch"
-            cmd_ (Cwd src) "git apply ../patches/librime-perf-syllabifier-cache-repeated-QuerySpelling-iterat.patch"
-            cmd_ (Cwd src) "git apply ../patches/librime-perf-deploy-compile-independent-dictionaries-in-para.patch"
-            -- in-memory sorted cache for user dictionary queries
-            cmd_ (Cwd src) "git apply ../patches/librime-userdict-cache.patch"
-            -- dict file growth invalidates raw pointers after remap, which used
-            -- to corrupt the table/reverse/prism header ("invalid metadata")
-            cmd_ (Cwd src) "git apply ../patches/librime-fix-mapped-file-remap.patch"
-            -- delete_notifier is multicast; refreshing the composition inside a
-            -- listener made later listeners delete a second, unrelated word
-            -- ("forget one word, lose two"). Defer the rebuild to the end of the
-            -- dispatch instead.
-            cmd_ (Cwd src) "git apply ../patches/librime-defer-composition-refresh-on-delete.patch"
-            -- PR #1232 "rewrite" filter (rewriter / rewrite_compiler /
-            -- rewrite_pack). Additive: Compile() returns early when the schema
-            -- declares no rewriter section, so existing schemas are unaffected.
-            -- Authored against upstream 74bd5dc4, which is the pinned submodule.
-            cmd_ (Cwd src) "git apply ../patches/librime-pr1232-rewrite-filter.patch"
-            -- DetectModifications decided "the config changed" by comparing the
-            -- newest mtime of the data directories (or a *.yaml directly inside
-            -- them) against var/last_build_time. Unrelated activity in the same
-            -- directory - a userdb being written, CleanupTrash moving files into
-            -- trash/, the .temp.userdb scratch dir that sync creates and removes,
-            -- installation.yaml being rewritten - bumped that mtime too, and the
-            -- tasks that run after last_build_time is recorded bumped it again.
-            -- On Android the result was a full deployment on essentially every
-            -- cold start, and every keystroke typed during it was dropped or
-            -- leaked to the editor. Compare a fingerprint of the config files
-            -- themselves instead. Must stay last: it is authored against the
-            -- state produced by all of the patches above.
-            cmd_ (Cwd src) "git apply ../patches/librime-detect-modifications-fingerprint.patch",
+            -- Core customizations are committed in SandyYuR/librime.
+            -- Validate the exact pin; never reapply legacy core patches.
+            cmd_ "python3" "scripts/verify-librime-source.py" src,
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",
