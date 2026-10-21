@@ -30,7 +30,7 @@
 	url = https://github.com/s-yata/marisa-trie
 [submodule "librime"]
 	path = librime
-	url = https://github.com/rime/librime
+	url = https://github.com/SandyYuR/librime.git
 	fetchRecurseSubmodules = false
 [submodule "librime-lua"]
 	path = librime-lua

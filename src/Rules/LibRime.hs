@@ -43,12 +43,9 @@ librimeRule = do
             cmd_ (Cwd librimePredictSrc) "git checkout ."
             cmd_ (Cwd librimePredictSrc) "git submodule update --init --recursive -v"
             cmd_ (Cwd librimePredictSrc) "git apply ../patches/librime-predict.patch"
-            -- Ordered shared series; the deployment fingerprint remains last.
-            cmd_ (Cwd src) "git checkout ."
-            cmd_ (Cwd src) "git clean -xdf test"
-            patches <- readFileLines "patches/librime-series"
-            forM_ (filter (\p -> not (null p) && head p /= '#') patches) $ \patch ->
-              cmd_ (Cwd src) "git" "apply" ("../patches" </> patch),
+            -- Core customizations are committed in SandyYuR/librime.
+            -- Validate the exact pin; never reapply legacy core patches.
+            cmd_ "python3" "scripts/verify-librime-source.py" src,
           cmakeFlags = \BuildEnv {..} ->
             [ "-DBUILD_SHARED_LIBS=OFF",
               "-DBUILD_STATIC=ON",
