@@ -8,6 +8,10 @@ repo=$(git rev-parse --show-toplevel)
 ndk=${ANDROID_NDK_ROOT:?Android NDK required}
 cmake_bin=${CMAKE_BIN:-cmake}
 case "$abi" in armeabi-v7a|arm64-v8a|x86|x86_64) ;; *) exit 2 ;; esac
+ninja_args=()
+if [[ -x "$(dirname "$cmake_bin")/ninja" ]]; then
+  ninja_args+=("-DCMAKE_MAKE_PROGRAM=$(dirname "$cmake_bin")/ninja")
+fi
 mkdir -p "$work"
 python3 "$repo/scripts/prepare-librime.py" "$work/sources"
 prefix="$work/product/librime/$abi"
@@ -17,7 +21,7 @@ for dependency in boost glog yaml-cpp leveldb marisa opencc lua; do
   roots+="${roots:+;}$deps/$dependency/$abi"
 done
 "$cmake_bin" -S "$work/sources/librime" -B "$work/cmake" -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+  "${ninja_args[@]}" -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI="$abi" -DANDROID_PLATFORM=23 -DANDROID_STL=c++_shared \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
   -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC=ON -DBUILD_TEST=OFF -DBUILD_TOOLS=OFF \
