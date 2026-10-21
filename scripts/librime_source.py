@@ -15,6 +15,8 @@ def verify_source(source: Path, pin: str, repository: str):
         raise ValueError('librime checkout does not match the prebuilder gitlink')
     if subprocess.run(['git', '-C', str(source), 'diff', '--quiet', 'HEAD', '--']).returncode:
         raise ValueError('librime has modified tracked files; commit source changes first')
+    if git(source, 'ls-files', '--others', '--exclude-standard', '--', 'src', 'test'):
+        raise ValueError('librime has untracked source files; commit source changes first')
     manifest = source / 'downstream/manifest.json'
     data = json.loads(manifest.read_text())
     normalize = lambda value: value.removesuffix('/').removesuffix('.git')

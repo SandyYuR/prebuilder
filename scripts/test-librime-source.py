@@ -60,6 +60,13 @@ class SourceContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'configured librime repository'):
             verify_source(self.root, self.pin, self.repository)
 
+    def test_untracked_compilation_input_is_rejected_without_deleting_it(self):
+        source = self.root / 'src/extra.cc'
+        source.write_text('// not part of the pinned source\n')
+        with self.assertRaisesRegex(ValueError, 'untracked source files'):
+            verify_source(self.root, self.pin, self.repository)
+        self.assertTrue(source.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
