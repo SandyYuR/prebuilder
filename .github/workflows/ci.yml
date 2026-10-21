@@ -15,6 +15,10 @@ permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: prebuilder-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     if: inputs.target != 'librime-only' && !startsWith(github.head_ref || github.ref_name, 'feat/librime-')
