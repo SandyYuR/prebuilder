@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from librime_source import verify_source
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -35,11 +36,9 @@ def apply(target, name):
     return {'name': name, 'sha256': hashlib.sha256(patch.read_bytes()).hexdigest()}
 
 record = {'prebuilder_commit': git(root, 'rev-parse', 'HEAD'), 'plugins': {}}
-record['upstream_commit'] = snapshot('librime', out / 'librime')
-series = [p.strip() for p in (root / 'patches/librime-series').read_text().splitlines()
-          if p.strip() and not p.startswith('#')]
-assert series[-1] == 'librime-detect-modifications-fingerprint.patch'
-record['patches'] = [apply(out / 'librime', p) for p in series]
+pin = snapshot('librime', out / 'librime')
+repository = git(root, 'config', '--file', '.gitmodules', 'submodule.librime.url')
+record.update(verify_source(out / 'librime', pin, repository))
 if not args.without_plugins:
     for module, directory, patch in [('librime-lua', 'lua', 'librime-lua.patch'),
         ('librime-octagram', 'octagram', 'librime-octagram.patch'),
